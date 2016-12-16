@@ -2,3 +2,4 @@
 *.sublime-workspace
 .ipynb_checkpoints/
 debug/
+__pycache__/
