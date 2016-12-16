@@ -42,9 +42,9 @@ class LaneRidge(BaseEstimator):
         n_features = X1.shape[1]
 
         if self.w_reg is None:
-            self.w_reg = np.zeros((n_features, ), dtype=X1.dtype)
+            self.w_reg = np.zeros((2*n_features, ), dtype=X1.dtype)
         if self.alpha is None:
-            self.alpha = np.zeros((n_features, ), dtype=X1.dtype)
+            self.alpha = np.zeros((2*n_features, ), dtype=X1.dtype)
 
         # Pre-compute some quantities.
         X1X1 = X1.T @ X1
@@ -59,8 +59,19 @@ class LaneRidge(BaseEstimator):
 
             l1 = np.sum(np.square(y1 - X1 @ w1)) * 1. / n_samples1
             l2 = np.sum(np.square(y2 - X2 @ w2)) * 1. / n_samples2
-            lreg = np.dot(self.alpha, np.square(w - self.w_reg))
-            return l1 + l2 + lreg
+            # lreg = np.dot(self.alpha, np.square(w - self.w_reg))
+
+            idx = alpha[3]
+            kappa1 = (2*w1[2]) / ((1 + w1[1])**1.5 + 2*w1[2]*w[3])
+            kappa2 = (2*w2[2]) / ((1 + w2[1])**1.5 - 2*w2[2]*w[3])
+            lreg1 = self.alpha[0] * np.abs(kappa1 - kappa2)**idx
+
+            lreg2 = self.alpha[1] * np.abs(w[4])**idx
+
+            dist = np.abs(np.sum(w2) - np.sum(w1) - 2 * w[3])
+            lreg3 = self.alpha[2] * dist**idx
+
+            return l1 + l2 + lreg1 + lreg2 + lreg3
 
         def loss_gradient(w):
             wavg = w[:3]
@@ -73,13 +84,23 @@ class LaneRidge(BaseEstimator):
             return g
 
         # Minimize using BFGS (better method?)
-        w0 = w0 or np.zeros((n_features, ), dtype=X1.dtype)
+        if w0 is None:
+            w0 = np.zeros((2*n_features, ), dtype=X1.dtype)
+        # options = {
+        #     'disp': True,
+        #     'gtol': self.tol,
+        #     'maxiter': self.max_iter
+        # }
+        # res = minimize(loss, w0, method='BFGS', jac=loss_gradient, options=options)
         options = {
             'disp': True,
-            'gtol': self.tol,
             'maxiter': self.max_iter
         }
-        res = minimize(loss, w0, method='BFGS', jac=loss_gradient, options=options)
+        res = minimize(loss, w0, method='BFGS', options=options)
+
+        # Save parameters.
+        self.intercept_ = None
+        self.coef_ = res.x
 
         print(res.x)
         print(res.success)
@@ -89,9 +110,14 @@ class LaneRidge(BaseEstimator):
         # self.coef_ = []
         # self.n_iter_ = 0
 
-    def predict(X):
-        pass
+    def predict(self, X1, X2):
+        """Predict y1 and y2 based on X1 and X2.
+        """
+        w = self.coef_
+        w1 = w[:3] - w[3:]
+        w2 = w[:3] + w[3:]
+        return X1 @ w1, X2 @ w2
 
-    def score(X, y):
+    def score(self, X1, y1, X2, y2):
         pass
 
