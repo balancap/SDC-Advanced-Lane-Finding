@@ -5,7 +5,7 @@
 # License: BSD 3 clause
 
 import numpy as np
-import warnings
+import numba
 
 from sklearn.base import BaseEstimator, MetaEstimatorMixin, RegressorMixin, clone
 from sklearn.utils import check_random_state, check_array, check_consistent_length
@@ -16,7 +16,163 @@ from sklearn.utils.validation import has_fit_parameter
 
 _EPSILON = np.spacing(1)
 
+# =========================================================================== #
+# Ransac pre-fitting.
+# =========================================================================== #
+@numba.jit(nopython=True, nogil=True)
+def inverse_4x4(m):
+    """Inverse 4x4 matrix. Manual implementation!
 
+    Allow comparison with numpy.inv, see if it is actually faster or the
+    latter makes use of additional optimisations (MKL?)
+    """
+    mflat = m.reshape((m.size, ))
+    minv = np.zeros_like(mflat)
+
+    # Compute individual coefficient.
+    minv[0] = \
+        mflat[5] * mflat[10] * mflat[15] - \
+        mflat[5] * mflat[11] * mflat[14] - \
+        mflat[9] * mflat[6] * mflat[15] + \
+        mflat[9] * mflat[7] * mflat[14] + \
+        mflat[13] * mflat[6] * mflat[11] - \
+        mflat[13] * mflat[7] * mflat[10]
+
+    minv[4] = \
+        -mflat[4] * mflat[10] * mflat[15] + \
+        mflat[4] * mflat[11] * mflat[14] + \
+        mflat[8] * mflat[6] * mflat[15] - \
+        mflat[8] * mflat[7] * mflat[14] - \
+        mflat[12] * mflat[6] * mflat[11] + \
+        mflat[12] * mflat[7] * mflat[10]
+
+    minv[8] = \
+        mflat[4] * mflat[9] * mflat[15] - \
+        mflat[4] * mflat[11] * mflat[13] - \
+        mflat[8] * mflat[5] * mflat[15] + \
+        mflat[8] * mflat[7] * mflat[13] + \
+        mflat[12] * mflat[5] * mflat[11] - \
+        mflat[12] * mflat[7] * mflat[9]
+
+    minv[12] = \
+        -mflat[4] * mflat[9] * mflat[14] + \
+        mflat[4] * mflat[10] * mflat[13] + \
+        mflat[8] * mflat[5] * mflat[14] - \
+        mflat[8] * mflat[6] * mflat[13] - \
+        mflat[12] * mflat[5] * mflat[10] + \
+        mflat[12] * mflat[6] * mflat[9]
+
+    minv[1] = \
+        -mflat[1] * mflat[10] * mflat[15] + \
+        mflat[1] * mflat[11] * mflat[14] + \
+        mflat[9] * mflat[2] * mflat[15] - \
+        mflat[9] * mflat[3] * mflat[14] - \
+        mflat[13] * mflat[2] * mflat[11] + \
+        mflat[13] * mflat[3] * mflat[10]
+
+    minv[5] = \
+        mflat[0] * mflat[10] * mflat[15] - \
+        mflat[0] * mflat[11] * mflat[14] - \
+        mflat[8] * mflat[2] * mflat[15] + \
+        mflat[8] * mflat[3] * mflat[14] + \
+        mflat[12] * mflat[2] * mflat[11] - \
+        mflat[12] * mflat[3] * mflat[10]
+
+    minv[9] = \
+        -mflat[0] * mflat[9] * mflat[15] + \
+        mflat[0] * mflat[11] * mflat[13] + \
+        mflat[8] * mflat[1] * mflat[15] - \
+        mflat[8] * mflat[3] * mflat[13] - \
+        mflat[12] * mflat[1] * mflat[11] + \
+        mflat[12] * mflat[3] * mflat[9]
+
+    minv[13] = \
+        mflat[0] * mflat[9] * mflat[14] - \
+        mflat[0] * mflat[10] * mflat[13] - \
+        mflat[8] * mflat[1] * mflat[14] + \
+        mflat[8] * mflat[2] * mflat[13] + \
+        mflat[12] * mflat[1] * mflat[10] - \
+        mflat[12] * mflat[2] * mflat[9]
+
+    minv[2] = \
+        mflat[1] * mflat[6] * mflat[15] - \
+        mflat[1] * mflat[7] * mflat[14] - \
+        mflat[5] * mflat[2] * mflat[15] + \
+        mflat[5] * mflat[3] * mflat[14] + \
+        mflat[13] * mflat[2] * mflat[7] - \
+        mflat[13] * mflat[3] * mflat[6]
+
+    minv[6] = \
+        -mflat[0] * mflat[6] * mflat[15] + \
+        mflat[0] * mflat[7] * mflat[14] + \
+        mflat[4] * mflat[2] * mflat[15] - \
+        mflat[4] * mflat[3] * mflat[14] - \
+        mflat[12] * mflat[2] * mflat[7] + \
+        mflat[12] * mflat[3] * mflat[6]
+
+    minv[10] = \
+        mflat[0] * mflat[5] * mflat[15] - \
+        mflat[0] * mflat[7] * mflat[13] - \
+        mflat[4] * mflat[1] * mflat[15] + \
+        mflat[4] * mflat[3] * mflat[13] + \
+        mflat[12] * mflat[1] * mflat[7] - \
+        mflat[12] * mflat[3] * mflat[5]
+
+    minv[14] = \
+        -mflat[0] * mflat[5] * mflat[14] + \
+        mflat[0] * mflat[6] * mflat[13] + \
+        mflat[4] * mflat[1] * mflat[14] - \
+        mflat[4] * mflat[2] * mflat[13] - \
+        mflat[12] * mflat[1] * mflat[6] + \
+        mflat[12] * mflat[2] * mflat[5]
+
+    minv[3] = \
+        -mflat[1] * mflat[6] * mflat[11] + \
+        mflat[1] * mflat[7] * mflat[10] + \
+        mflat[5] * mflat[2] * mflat[11] - \
+        mflat[5] * mflat[3] * mflat[10] - \
+        mflat[9] * mflat[2] * mflat[7] + \
+        mflat[9] * mflat[3] * mflat[6]
+
+    minv[7] = \
+        mflat[0] * mflat[6] * mflat[11] - \
+        mflat[0] * mflat[7] * mflat[10] - \
+        mflat[4] * mflat[2] * mflat[11] + \
+        mflat[4] * mflat[3] * mflat[10] + \
+        mflat[8] * mflat[2] * mflat[7] - \
+        mflat[8] * mflat[3] * mflat[6]
+
+    minv[11] = \
+        -mflat[0] * mflat[5] * mflat[11] + \
+        mflat[0] * mflat[7] * mflat[9] + \
+        mflat[4] * mflat[1] * mflat[11] - \
+        mflat[4] * mflat[3] * mflat[9] - \
+        mflat[8] * mflat[1] * mflat[7] + \
+        mflat[8] * mflat[3] * mflat[5]
+
+    minv[15] = \
+        mflat[0] * mflat[5] * mflat[10] - \
+        mflat[0] * mflat[6] * mflat[9] - \
+        mflat[4] * mflat[1] * mflat[10] + \
+        mflat[4] * mflat[2] * mflat[9] + \
+        mflat[8] * mflat[1] * mflat[6] - \
+        mflat[8] * mflat[2] * mflat[5]
+
+    det = mflat[0] * minv[0] + mflat[1] * minv[4] + mflat[2] * minv[8] + mflat[3] * minv[12]
+    det = 1.0 / det
+
+    for i in range(16):
+        minv[i] = minv[i] * det
+    minv = minv.reshape(m.shape)
+
+    # if det == 0:
+    #     return false;
+    return minv
+
+
+# =========================================================================== #
+# Main Ransac implementation.
+# =========================================================================== #
 def _dynamic_max_trials(n_inliers, n_samples, min_samples, probability):
     """Determine number trials such that at least one outlier-free subset is
     sampled for the given inlier/outlier ratio.
@@ -68,8 +224,8 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
     base_estimator : object, optional
         Base estimator object which implements the following methods:
 
-         * `fit(X, y)`: Fit model to given training data and target values.
-         * `score(X, y)`: Returns the mean accuracy on the given test data,
+        * `fit(X, y)`: Fit model to given training data and target values.
+        * `score(X, y)`: Returns the mean accuracy on the given test data,
            which is used for the stop criterion defined by `stop_score`.
            Additionally, the score is used to decide which of two equally
            large consensus sets is chosen as the better one.

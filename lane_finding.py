@@ -12,9 +12,9 @@ import matplotlib.pyplot as plt
 import matplotlib.image as mpimg
 
 
-# ============================================================================ #
+# =========================================================================== #
 # Plotting and drawing methods.
-# ============================================================================ #
+# =========================================================================== #
 def plot_images(imgs, titles, cmap='gray', figsize=(24, 9)):
     nimgs = len(imgs)
     f, axes = plt.subplots(1, nimgs, figsize=figsize)
@@ -52,9 +52,9 @@ def draw_mask(img, mask, color=[255, 0, 0], alpha=0.8, beta=1., gamma=0.):
     return cv2.addWeighted(img, alpha, color_mask, beta, gamma)
 
 
-# ============================================================================ #
+# =========================================================================== #
 # Calibration methods.
-# ============================================================================ #
+# =========================================================================== #
 def undistort_image(img, mtx, dist):
     return cv2.undistort(img, mtx, dist, None, mtx)
 
@@ -116,6 +116,16 @@ def test_calibration(fname, cshape, mtx, dist):
 # ============================================================================ #
 # Perspective transform.
 # ============================================================================ #
+def apply_scaling(x, y, scale, shape, reversed_x=True, dtype=np.float32):
+    """Apply scaling factor to X and Y vectors.
+    """
+    if reversed_x:
+        x = shape[0] - 1 - x
+    x = x / scale[0]
+    y = y / scale[1]
+    return x.astype(dtype), y.astype(dtype)
+
+
 def warp_image(img, mtx_perp, flags=cv2.INTER_LINEAR):
     img_size = (img.shape[1], img.shape[0])
     return cv2.warpPerspective(img, mtx_perp, img_size, flags=cv2.INTER_LINEAR)
@@ -149,9 +159,9 @@ def test_perspective(img, src_points, mtx_perp):
               title2='Warped image.', figsize=(24, 9))
 
 
-# ============================================================================ #
+# =========================================================================== #
 # Loading / Saving methods
-# ============================================================================ #
+# =========================================================================== #
 def load_image(filename, crop_shape=(720, 1280)):
     """Load an image, and crop it to the correct shape if necessary.
     """
