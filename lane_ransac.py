@@ -51,7 +51,7 @@ def _dynamic_max_trials(n_inliers, n_samples, min_samples, probability):
     return abs(float(np.ceil(np.log(nom) / np.log(denom))))
 
 
-class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
+class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
     """RANSAC (RANdom SAmple Consensus) algorithm.
 
     RANSAC is an iterative algorithm for the robust estimation of parameters
@@ -195,44 +195,26 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         self.random_state = random_state
         self.loss = loss
 
-    def fit(self, X, y, sample_weight=None):
+    def fit(self, X1, y1, X2, y2, sample_weight=None):
         """Fit estimator using RANSAC algorithm.
-
-        Parameters
-        ----------
-        X : array-like or sparse matrix, shape [n_samples, n_features]
-            Training data.
-
-        y : array-like, shape = [n_samples] or [n_samples, n_targets]
-            Target values.
-
-        sample_weight : array-like, shape = [n_samples]
-            Individual weights for each sample
-            raises error if sample_weight is passed and base_estimator
-            fit method does not support it.
-
-        Raises
-        ------
-        ValueError
-            If no valid consensus set could be found. This occurs if
-            `is_data_valid` and `is_model_valid` return False for all
-            `max_trials` randomly chosen sub-samples.
-
         """
-        X = check_array(X, accept_sparse='csr')
-        y = check_array(y, ensure_2d=False)
-        check_consistent_length(X, y)
+        # X = check_array(X, accept_sparse='csr')
+        # y = check_array(y, ensure_2d=False)
+        check_consistent_length(X1, y1)
+        check_consistent_length(X2, y2)
 
         if self.base_estimator is not None:
-            base_estimator = clone(self.base_estimator)
+            base_estimator1 = clone(self.base_estimator)
+            base_estimator2 = clone(self.base_estimator)
         else:
-            base_estimator = LinearRegression()
+            base_estimator1 = LinearRegression()
+            base_estimator2 = LinearRegression()
 
+        # assume linear model by default
         if self.min_samples is None:
-            # assume linear model by default
-            min_samples = X.shape[1] + 1
+            min_samples = X1.shape[1] + 1
         elif 0 < self.min_samples < 1:
-            min_samples = np.ceil(self.min_samples * X.shape[0])
+            min_samples = np.ceil(self.min_samples * X1.shape[0])
         elif self.min_samples >= 1:
             if self.min_samples % 1 != 0:
                 raise ValueError("Absolute number of samples must be an "
@@ -241,9 +223,9 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         else:
             raise ValueError("Value for `min_samples` must be scalar and "
                              "positive.")
-        if min_samples > X.shape[0]:
+        if min_samples > X1.shape[0] or min_samples > X2.shape[0]:
             raise ValueError("`min_samples` may not be larger than number "
-                             "of samples ``X.shape[0]``.")
+                             "of samples ``X1-2.shape[0]``.")
 
         if self.stop_probability < 0 or self.stop_probability > 1:
             raise ValueError("`stop_probability` must be in range [0, 1].")
@@ -254,29 +236,20 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         else:
             residual_threshold = self.residual_threshold
 
-        if self.residual_metric is not None:
-            warnings.warn(
-                "'residual_metric' was deprecated in version 0.18 and "
-                "will be removed in version 0.20. Use 'loss' instead.",
-                DeprecationWarning)
-
         if self.loss == "absolute_loss":
-            if y.ndim == 1:
+            if y1.ndim == 1:
                 loss_function = lambda y_true, y_pred: np.abs(y_true - y_pred)
             else:
                 loss_function = lambda \
                     y_true, y_pred: np.sum(np.abs(y_true - y_pred), axis=1)
-
         elif self.loss == "squared_loss":
-            if y.ndim == 1:
+            if y1.ndim == 1:
                 loss_function = lambda y_true, y_pred: (y_true - y_pred) ** 2
             else:
                 loss_function = lambda \
                     y_true, y_pred: np.sum((y_true - y_pred) ** 2, axis=1)
-
         elif callable(self.loss):
             loss_function = self.loss
-
         else:
             raise ValueError(
                 "loss should be 'absolute_loss', 'squared_loss' or a callable."
@@ -284,117 +257,138 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
 
 
         random_state = check_random_state(self.random_state)
-
         try:  # Not all estimator accept a random_state
-            base_estimator.set_params(random_state=random_state)
+            base_estimator1.set_params(random_state=random_state)
+            base_estimator2.set_params(random_state=random_state)
         except ValueError:
             pass
 
-        estimator_fit_has_sample_weight = has_fit_parameter(base_estimator,
+        estimator_fit_has_sample_weight = has_fit_parameter(base_estimator1,
                                                             "sample_weight")
-        estimator_name = type(base_estimator).__name__
-        if (sample_weight is not None and not
-                estimator_fit_has_sample_weight):
+        estimator_name = type(base_estimator1).__name__
+        if (sample_weight is not None and not estimator_fit_has_sample_weight):
             raise ValueError("%s does not support sample_weight. Samples"
                              " weights are only used for the calibration"
                              " itself." % estimator_name)
         if sample_weight is not None:
             sample_weight = np.asarray(sample_weight)
 
-        n_inliers_best = 0
-        score_best = np.inf
-        inlier_mask_best = None
-        X_inlier_best = None
-        y_inlier_best = None
+        # Best match variables.
+        n_inliers_best1 = 0
+        n_inliers_best2 = 0
+        score_best1 = np.inf
+        score_best2 = np.inf
+        inlier_mask_best1 = None
+        inlier_mask_best2 = None
+        X1_inlier_best = None
+        X2_inlier_best = None
+        y1_inlier_best = None
+        y2_inlier_best = None
 
         # number of data samples
-        n_samples = X.shape[0]
-        sample_idxs = np.arange(n_samples)
-
-        n_samples, _ = X.shape
+        n_samples1 = X1.shape[0]
+        sample_idxs1 = np.arange(n_samples1)
+        n_samples2 = X2.shape[0]
+        sample_idxs2 = np.arange(n_samples2)
 
         for self.n_trials_ in range(1, self.max_trials + 1):
 
-            # choose random sample set
-            subset_idxs = sample_without_replacement(n_samples, min_samples,
-                                                     random_state=random_state)
-            X_subset = X[subset_idxs]
-            y_subset = y[subset_idxs]
+            # Choose random sample sets 1 and 2
+            subset_idxs1 = sample_without_replacement(n_samples1, min_samples,
+                                                      random_state=random_state)
+            X1_subset = X1[subset_idxs1]
+            y1_subset = y1[subset_idxs1]
+            subset_idxs2 = sample_without_replacement(n_samples2, min_samples,
+                                                      random_state=random_state)
+            X2_subset = X2[subset_idxs2]
+            y2_subset = y2[subset_idxs2]
 
             # check if random sample set is valid
-            if (self.is_data_valid is not None
-                    and not self.is_data_valid(X_subset, y_subset)):
+            if (self.is_data_valid is not None and not
+                    self.is_data_valid(X1_subset, y1_subset, X2_subset, y2_subset)):
                 continue
 
             # fit model for current random sample set
             if sample_weight is None:
-                base_estimator.fit(X_subset, y_subset)
-            else:
-                base_estimator.fit(X_subset, y_subset,
-                                   sample_weight=sample_weight[subset_idxs])
+                base_estimator1.fit(X1_subset, y1_subset)
+                base_estimator2.fit(X2_subset, y2_subset)
+            # else:
+            #     base_estimator.fit(X_subset, y_subset,
+            #                        sample_weight=sample_weight[subset_idxs])
 
             # check if estimated model is valid
             if (self.is_model_valid is not None and not
-                    self.is_model_valid(base_estimator, X_subset, y_subset)):
+                    self.is_model_valid(base_estimator1, X1_subset, y1_subset,
+                                        base_estimator2, X2_subset, y2_subset)):
                 continue
 
-            # residuals of all data for current random sample model
-            y_pred = base_estimator.predict(X)
+            # Predictions on full dataset.
+            y_pred1 = base_estimator1.predict(X1)
+            y_pred2 = base_estimator2.predict(X2)
 
-            # XXX: Deprecation: Remove this if block in 0.20
-            if self.residual_metric is not None:
-                diff = y_pred - y
-                if diff.ndim == 1:
-                    diff = diff.reshape(-1, 1)
-                residuals_subset = self.residual_metric(diff)
-            else:
-                residuals_subset = loss_function(y, y_pred)
+            residuals_subset1 = loss_function(y1, y_pred1)
+            residuals_subset2 = loss_function(y2, y_pred2)
 
             # classify data into inliers and outliers
-            inlier_mask_subset = residuals_subset < residual_threshold
-            n_inliers_subset = np.sum(inlier_mask_subset)
+            inlier_mask_subset1 = residuals_subset1 < residual_threshold
+            n_inliers_subset1 = np.sum(inlier_mask_subset1)
+            inlier_mask_subset2 = residuals_subset2 < residual_threshold
+            n_inliers_subset2 = np.sum(inlier_mask_subset2)
 
             # less inliers -> skip current random sample
-            if n_inliers_subset < n_inliers_best:
+            if n_inliers_subset1 + n_inliers_subset2 < n_inliers_best1 + n_inliers_best2:
                 continue
-            if n_inliers_subset == 0:
-                raise ValueError("No inliers found, possible cause is "
-                    "setting residual_threshold ({0}) too low.".format(
-                    self.residual_threshold))
+            if n_inliers_subset1 == 0 or n_inliers_subset2 == 0:
+                continue
+                # raise ValueError("No inliers found, possible cause is "
+                #     "setting residual_threshold ({0}) too low.".format(
+                #     self.residual_threshold))
 
             # extract inlier data set
-            inlier_idxs_subset = sample_idxs[inlier_mask_subset]
-            X_inlier_subset = X[inlier_idxs_subset]
-            y_inlier_subset = y[inlier_idxs_subset]
+            inlier_idxs_subset1 = sample_idxs1[inlier_mask_subset1]
+            X1_inlier_subset = X1[inlier_idxs_subset1]
+            y1_inlier_subset = y1[inlier_idxs_subset1]
 
-            # score of inlier data set
-            score_subset = base_estimator.score(X_inlier_subset,
-                                                y_inlier_subset)
+            inlier_idxs_subset2 = sample_idxs2[inlier_mask_subset2]
+            X2_inlier_subset = X2[inlier_idxs_subset2]
+            y2_inlier_subset = y2[inlier_idxs_subset2]
 
-            # same number of inliers but worse score -> skip current random
-            # sample
-            if (n_inliers_subset == n_inliers_best
-                    and score_subset < score_best):
+            # Score of inlier datasets
+            score_subset1 = base_estimator1.score(X1_inlier_subset,
+                                                  y1_inlier_subset)
+            score_subset2 = base_estimator2.score(X2_inlier_subset,
+                                                  y2_inlier_subset)
+
+            # same number of inliers but worse score -> skip.
+            if (n_inliers_subset1 + n_inliers_subset2 == n_inliers_best1 + n_inliers_best2
+                    and score_subset1 + score_subset2 < score_best1 + score_best2):
                 continue
 
             # save current random sample as best sample
-            n_inliers_best = n_inliers_subset
-            score_best = score_subset
-            inlier_mask_best = inlier_mask_subset
-            X_inlier_best = X_inlier_subset
-            y_inlier_best = y_inlier_subset
+            n_inliers_best1 = n_inliers_subset1
+            score_best1 = score_subset1
+            inlier_mask_best1 = inlier_mask_subset1
+            X1_inlier_best = X1_inlier_subset
+            y1_inlier_best = y1_inlier_subset
+
+            n_inliers_best2 = n_inliers_subset2
+            score_best2 = score_subset2
+            inlier_mask_best2 = inlier_mask_subset2
+            X2_inlier_best = X2_inlier_subset
+            y2_inlier_best = y2_inlier_subset
 
             # break if sufficient number of inliers or score is reached
-            if (n_inliers_best >= self.stop_n_inliers
-                    or score_best >= self.stop_score
-                    or self.n_trials_
-                       >= _dynamic_max_trials(n_inliers_best, n_samples,
-                                              min_samples,
-                                              self.stop_probability)):
+            if ((n_inliers_best1 >= self.stop_n_inliers
+                    and n_inliers_best2 >= self.stop_n_inliers)
+                    or (score_best1 >= self.stop_score and score_best2 >= self.stop_score)):
+                    # or self.n_trials_
+                    #    >= _dynamic_max_trials(n_inliers_best, n_samples,
+                    #                           min_samples,
+                    #                           self.stop_probability)):
                 break
 
         # if none of the iterations met the required criteria
-        if inlier_mask_best is None:
+        if inlier_mask_best1 is None or inlier_mask_best2 is None :
             raise ValueError(
                 "RANSAC could not find valid consensus set, because"
                 " either the `residual_threshold` rejected all the samples or"
@@ -402,14 +396,17 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                 " `max_trials` randomly ""chosen sub-samples. Consider "
                 "relaxing the ""constraints.")
 
-        # estimate final model using all inliers
-        base_estimator.fit(X_inlier_best, y_inlier_best)
+        # Estimate final model using all inliers
+        base_estimator1.fit(X1_inlier_best, y1_inlier_best)
+        base_estimator2.fit(X2_inlier_best, y2_inlier_best)
 
-        self.estimator_ = base_estimator
-        self.inlier_mask_ = inlier_mask_best
+        self.estimator1_ = base_estimator1
+        self.inlier_mask1_ = inlier_mask_best1
+        self.estimator2_ = base_estimator2
+        self.inlier_mask2_ = inlier_mask_best2
         return self
 
-    def predict(self, X):
+    def predict(self, X1, X2):
         """Predict using the estimated model.
 
         This is a wrapper for `estimator_.predict(X)`.
@@ -423,11 +420,9 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         y : array, shape = [n_samples] or [n_samples, n_targets]
             Returns predicted values.
         """
-        check_is_fitted(self, 'estimator_')
+        return self.estimator1_.predict(X1), self.estimator2_.predict(X2)
 
-        return self.estimator_.predict(X)
-
-    def score(self, X, y):
+    def score(self, X1, y1, X2, y2):
         """Returns the score of the prediction.
 
         This is a wrapper for `estimator_.score(X, y)`.
@@ -445,6 +440,4 @@ class LaneRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         z : float
             Score of the prediction.
         """
-        check_is_fitted(self, 'estimator_')
-
-        return self.estimator_.score(X, y)
+        return self.estimator1_.score(X1, y1) + self.estimator1_.score(X2, y2)

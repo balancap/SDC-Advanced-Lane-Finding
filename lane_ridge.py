@@ -28,7 +28,7 @@ class LaneRidge(BaseEstimator):
         self.tol = tol
         self.random_state = random_state
 
-    def fit(self, X1, y1, X2, y2, w0=None, sample_weight=None):
+    def fit(self, X1, y1, X2, y2, w0=None, sample_weight=None, disp=True):
         # Check a few things...
         assert X1.shape[0] == y1.shape[0], X2.shape[0] == y2.shape[0]
         assert X1.shape[1] == X2.shape[1]
@@ -61,7 +61,7 @@ class LaneRidge(BaseEstimator):
             l2 = np.sum(np.square(y2 - X2 @ w2)) * 1. / n_samples2
             # lreg = np.dot(self.alpha, np.square(w - self.w_reg))
 
-            idx = alpha[3]
+            idx = self.alpha[3]
             kappa1 = (2*w1[2]) / ((1 + w1[1])**1.5 + 2*w1[2]*w[3])
             kappa2 = (2*w2[2]) / ((1 + w2[1])**1.5 - 2*w2[2]*w[3])
             lreg1 = self.alpha[0] * np.abs(kappa1 - kappa2)**idx
@@ -102,13 +102,8 @@ class LaneRidge(BaseEstimator):
         self.intercept_ = None
         self.coef_ = res.x
 
-        print(res.x)
-        print(res.success)
-        # res.x
-
-        # self.intercept_ = 0.0
-        # self.coef_ = []
-        # self.n_iter_ = 0
+        # print(res.x)
+        # print(res.success)
 
     def predict(self, X1, X2):
         """Predict y1 and y2 based on X1 and X2.
