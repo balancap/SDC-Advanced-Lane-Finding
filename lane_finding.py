@@ -15,9 +15,18 @@ import matplotlib.image as mpimg
 # ============================================================================ #
 # Plotting and drawing methods.
 # ============================================================================ #
+def plot_images(imgs, titles, cmap='gray', figsize=(24, 9)):
+    nimgs = len(imgs)
+    f, axes = plt.subplots(1, nimgs, figsize=figsize)
+    f.tight_layout()
+    for i in range(nimgs):
+        axes[i].imshow(imgs[i], cmap=cmap)
+        axes[i].set_title(titles[i], fontsize=25)
+
+
 def plot_dual(img1, img2, title1='', title2='', figsize=(24, 9)):
 
-    f, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 9))
+    f, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
     f.tight_layout()
     ax1.imshow(img1)
     ax1.set_title(title1, fontsize=25)
@@ -81,7 +90,10 @@ def calibration_parameters(path, cshape):
             print('Warning! Not chessboard found in image', fname)
 
     # Calibration from image points.
-    ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints, imgpoints, img.shape[0:2], None, None)
+    ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints,
+                                                       imgpoints,
+                                                       img.shape[0:2],
+                                                       None, None)
     return mtx, dist
 
 
