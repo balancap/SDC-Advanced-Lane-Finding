@@ -20,6 +20,60 @@ _EPSILON = np.spacing(1)
 # Ransac pre-fitting.
 # =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
+def inverse_3x3(m):
+    """Inverse 3x3 matrix. Manual implementation!
+    """
+    mflat = m.reshape((m.size, ))
+    minv = np.zeros_like(mflat)
+
+    minv[0] = mflat[4] * mflat[8] - mflat[5] * mflat[7]
+    minv[3] = -mflat[3] * mflat[8] + mflat[5] * mflat[6]
+    minv[6] = mflat[3] * mflat[7] - mflat[4] * mflat[6]
+
+    minv[1] = -mflat[1] * mflat[8] + mflat[2] * mflat[7]
+    minv[4] = mflat[0] * mflat[8] - mflat[2] * mflat[6]
+    minv[7] = -mflat[0] * mflat[7] + mflat[1] * mflat[6]
+
+    minv[2] = mflat[1] * mflat[5] - mflat[2] * mflat[4]
+    minv[5] = -mflat[0] * mflat[5] + mflat[2] * mflat[3]
+    minv[8] = mflat[0] * mflat[4] - mflat[1] * mflat[3]
+
+    det = mflat[0] * minv[0] + mflat[1] * minv[3] + mflat[2] * minv[6]
+    det = 1.0 / det
+    for i in range(9):
+        minv[i] = minv[i] * det
+    minv = minv.reshape((3, 3))
+    return minv
+
+
+@numba.jit(nopython=True, nogil=True)
+def inverse_3x3_symmetric(m):
+    """Inverse 3x3 matrix. Manual implementation!
+    """
+    mflat = m.reshape((m.size, ))
+    minv = np.zeros_like(mflat)
+
+    minv[0] = mflat[4] * mflat[8] - mflat[5] * mflat[7]
+    minv[3] = -mflat[3] * mflat[8] + mflat[5] * mflat[6]
+    minv[6] = mflat[3] * mflat[7] - mflat[4] * mflat[6]
+
+    minv[1] = minv[3]
+    minv[4] = mflat[0] * mflat[8] - mflat[2] * mflat[6]
+    minv[7] = -mflat[0] * mflat[7] + mflat[1] * mflat[6]
+
+    minv[2] = minv[2]
+    minv[5] = minv[7]
+    minv[8] = mflat[0] * mflat[4] - mflat[1] * mflat[3]
+
+    det = mflat[0] * minv[0] + mflat[1] * minv[3] + mflat[2] * minv[6]
+    det = 1.0 / det
+    for i in range(9):
+        minv[i] = minv[i] * det
+    minv = minv.reshape((3, 3))
+    return minv
+
+
+@numba.jit(nopython=True, nogil=True)
 def inverse_4x4(m):
     """Inverse 4x4 matrix. Manual implementation!
 
@@ -158,7 +212,10 @@ def inverse_4x4(m):
         mflat[8] * mflat[1] * mflat[6] - \
         mflat[8] * mflat[2] * mflat[5]
 
-    det = mflat[0] * minv[0] + mflat[1] * minv[4] + mflat[2] * minv[8] + mflat[3] * minv[12]
+    det = mflat[0] * minv[0] + \
+        mflat[1] * minv[4] + \
+        mflat[2] * minv[8] + \
+        mflat[3] * minv[12]
     det = 1.0 / det
 
     for i in range(16):
@@ -168,6 +225,100 @@ def inverse_4x4(m):
     # if det == 0:
     #     return false;
     return minv
+
+
+@numba.jit(nopython=True, nogil=True)
+def is_model_valid_simple(w1, w2, diffs, bounds):
+    """Check if a model is valid, based on the regression coefficients.
+
+    Bounds indexes (Nx2 array):
+      0: Origin distance bounds;
+      1: Angle difference bounds;
+      2: Curvature relative differnce bounds;
+    """
+    # Distance at the origin.
+    dist = w2[0] - w1[0]
+    res = np.abs(dist) <= diffs[0]
+
+    # Angle at the origin.
+    theta1 = np.arcsin(w1[1])
+    theta2 = np.arcsin(w2[1])
+    res = res and np.abs(theta1 - theta2) <= diffs[1]
+
+    # Relative curvature.
+    a1b2 = w1[2] * (1 + w2[1]**2)**1.5
+    a2b1 = w2[2] * (1 + w1[1]**2)**1.5
+    rel_curv = (a2b1 - a2b1 + 2*dist*w1[2]*w2[2]) / (a1b2 + a1b2)
+    res = res and np.abs(rel_curv) <= diffs[2]
+    return res
+
+
+@numba.jit(nopython=True, nogil=True)
+def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds):
+    """Construct some pre-fits for Ransac regression.
+    """
+    shape1 = X1.shape
+    shape2 = X2.shape
+    w1_prefits = np.zeros((n_prefits, 3), dtype=X1.dtype)
+    w2_prefits = np.zeros((n_prefits, 3), dtype=X1.dtype)
+
+    i = 0
+    i1 = 0
+    i2 = 0
+
+    idxes1 = np.arange(shape1[0])
+    idxes2 = np.arange(shape2[0])
+
+    # Fill the pre-fit arrays...
+    while i < n_prefits:
+        # Sub-sampling 4 points.
+        _X1 = X1[i1:i1+4]
+        _y1 = y1[i1:i1+4]
+        _X2 = X1[i2:i2+4]
+        _y2 = y1[i2:i2+4]
+
+        # Solve linear regression! Hard job :)
+        _X1T = _X1.T
+        _X2T = _X2.T
+        w1 = inverse_3x3_symmetric(_X1T @ _X1) @ _X1T @ _y1
+        w2 = inverse_3x3_symmetric(_X2T @ _X2) @ _X2T @ _y2
+
+        # Is model basically valid?
+        res = is_model_valid_simple(w1, w2, valid_diffs, valid_bounds)
+        if res:
+            w1_prefits[i] = w1
+            w2_prefits[i] = w2
+            i += 1
+
+        i1 += 1
+        i2 += 1
+
+        # Get to the end: reshuffle another time!
+        if i1 == shape1[0]-3:
+            np.random.shuffle(idxes1)
+            X1 = X1[idxes1]
+            y1 = y1[idxes1]
+            i1 = 0
+        if i2 == shape2[0]-3:
+            np.random.shuffle(idxes2)
+            X2 = X2[idxes2]
+            y2 = y2[idxes2]
+            i2 = 0
+
+    return w1_prefits, w2_prefits
+
+
+def test_lanes_ransac_prefit(n_prefits=1000):
+    n = n_prefits * 1
+    X1 = np.random.rand(n, 3)
+    X2 = np.random.rand(n, 3)
+    y1 = np.random.rand(n)
+    y2 = np.random.rand(n)
+
+    valid_diffs = np.ones((3, ), dtype=X1.dtype)
+    valid_bounds = np.ones((3, 2), dtype=X1.dtype)
+
+    lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds)
 
 
 # =========================================================================== #
