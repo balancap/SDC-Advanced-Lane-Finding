@@ -482,9 +482,12 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
     .. [3] http://www.bmva.org/bmvc/2009/Papers/Paper355/Paper355.pdf
     """
 
-    def __init__(self, base_estimator=None, min_samples=None,
-                 residual_threshold=None, is_data_valid=None,
-                 is_model_valid=None, max_trials=100,
+    def __init__(self, base_estimator=None,
+                 min_samples=None,
+                 residual_threshold=None,
+                 is_data_valid=None, is_model_valid=None,
+                 n_prefits=1000, max_trials=100,
+                 valid_diffs=None, valid_bounds=None,
                  stop_n_inliers=np.inf, stop_score=np.inf,
                  stop_probability=0.99, residual_metric=None,
                  loss='absolute_loss', random_state=None):
@@ -492,9 +495,14 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         self.base_estimator = base_estimator
         self.min_samples = min_samples
         self.residual_threshold = residual_threshold
+
         self.is_data_valid = is_data_valid
         self.is_model_valid = is_model_valid
+        self.n_prefits = n_prefits
         self.max_trials = max_trials
+        self.valid_diffs = valid_diffs
+        self.valid_bounds = valid_bounds
+
         self.stop_n_inliers = stop_n_inliers
         self.stop_score = stop_score
         self.stop_probability = stop_probability
@@ -580,6 +588,13 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         if sample_weight is not None:
             sample_weight = np.asarray(sample_weight)
 
+        # Pre-fit with small subsets (4 points).
+        # Allows to quickly pre-select some good configurations.
+        w1_prefits, w2_prefits = lanes_ransac_prefit(X1, y1, X2, y2,
+                                                     self.n_prefits,
+                                                     self.valid_diffs,
+                                                     self.valid_bounds)
+
         # Best match variables.
         n_inliers_best1 = 0
         n_inliers_best2 = 0
@@ -598,40 +613,16 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         n_samples2 = X2.shape[0]
         sample_idxs2 = np.arange(n_samples2)
 
-        for self.n_trials_ in range(1, self.max_trials + 1):
-
-            # Choose random sample sets 1 and 2
-            subset_idxs1 = sample_without_replacement(n_samples1, min_samples,
-                                                      random_state=random_state)
-            X1_subset = X1[subset_idxs1]
-            y1_subset = y1[subset_idxs1]
-            subset_idxs2 = sample_without_replacement(n_samples2, min_samples,
-                                                      random_state=random_state)
-            X2_subset = X2[subset_idxs2]
-            y2_subset = y2[subset_idxs2]
-
-            # check if random sample set is valid
-            if (self.is_data_valid is not None and not
-                    self.is_data_valid(X1_subset, y1_subset, X2_subset, y2_subset)):
-                continue
-
-            # fit model for current random sample set
-            if sample_weight is None:
-                base_estimator1.fit(X1_subset, y1_subset)
-                base_estimator2.fit(X2_subset, y2_subset)
-            # else:
-            #     base_estimator.fit(X_subset, y_subset,
-            #                        sample_weight=sample_weight[subset_idxs])
-
-            # check if estimated model is valid
-            if (self.is_model_valid is not None and not
-                    self.is_model_valid(base_estimator1, X1_subset, y1_subset,
-                                        base_estimator2, X2_subset, y2_subset)):
-                continue
+        for self.n_trials_ in range(0, self.n_prefits):
+            # Linear regression coefficients.
+            w1 = w1_prefits[self.n_trials_]
+            w2 = w2_prefits[self.n_trials_]
 
             # Predictions on full dataset.
-            y_pred1 = base_estimator1.predict(X1)
-            y_pred2 = base_estimator2.predict(X2)
+            y_pred1 = X1 @ w1
+            y_pred2 = X2 @ w2
+            # y_pred1 = base_estimator1.predict(X1)
+            # y_pred2 = base_estimator2.predict(X2)
 
             residuals_subset1 = loss_function(y1, y_pred1)
             residuals_subset2 = loss_function(y2, y_pred2)
