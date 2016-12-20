@@ -266,12 +266,14 @@ def is_model_valid(w1, w2, diffs, bounds):
     """
     # Distance at the origin.
     dist = w2[0] - w1[0]
-    res = np.abs(dist) <= diffs[0]
+    res = np.abs(dist) >= diffs[0, 0]
+    res = res and np.abs(dist) <= diffs[0, 1]
 
     # Angle at the origin.
     theta1 = np.arcsin(w1[1])
     theta2 = np.arcsin(w2[1])
-    res = res and np.abs(theta1 - theta2) <= diffs[1]
+    res = res and np.abs(theta1 - theta2) >= diffs[1, 0]
+    res = res and np.abs(theta1 - theta2) <= diffs[1, 1]
 
     # Relative curvature.
     a1b2 = w1[2] * (1 + w2[1]**2)**1.5
@@ -279,7 +281,8 @@ def is_model_valid(w1, w2, diffs, bounds):
     s = a1b2 + a2b1
     if np.abs(s) > _EPSILON:
         rel_curv = (a2b1 - a1b2 + 2*dist*w1[2]*w2[2]) / (a1b2 + a2b1)
-        res = res and np.abs(rel_curv) <= diffs[2]
+        res = res and np.abs(rel_curv) >= diffs[2, 0]
+        res = res and np.abs(rel_curv) <= diffs[2, 1]
     return res
 
 
@@ -327,13 +330,11 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_boun
         _y1 = y1[i1:i1+4]
         _X2 = X2[i2:i2+4]
         _y2 = y2[i2:i2+4]
-
         # Solve linear regression! Hard job :)
         _X1T = _X1.T
         _X2T = _X2.T
         w1 = inverse_3x3_symmetric(_X1T @ _X1) @ _X1T @ _y1
         w2 = inverse_3x3_symmetric(_X2T @ _X2) @ _X2T @ _y2
-
         # Is model basically valid? Then save it!
         res = is_model_valid(w1, w2, is_valid_diffs, is_valid_bounds)
         if res:
@@ -370,7 +371,22 @@ def test_lanes_ransac_prefit(n_prefits=1000):
     lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds)
 
 
-def linear_score(X, y, w):
+# =========================================================================== #
+# Linear Regression: some optimised methods.
+# =========================================================================== #
+@numba.jit(nopython=True, nogil=True)
+def linear_regression_predict(X, w):
+    """Linear Regression: predicted y from X and w.
+    """
+    y_pred = X @ w
+    return y_pred
+
+
+@numba.jit(nopython=True, nogil=True)
+def linear_regression_score(X, y, w):
+    """Linear Regression: score in interval [0,1]. Compute L2 norm and y
+    variance to obtain the score.
+    """
     y_pred = X @ w
     u = np.sum((y - y_pred)**2)
     v = np.sum((y - np.mean(y))**2)
@@ -385,25 +401,14 @@ def _dynamic_max_trials(n_inliers, n_samples, min_samples, probability):
     """Determine number trials such that at least one outlier-free subset is
     sampled for the given inlier/outlier ratio.
 
-    Parameters
-    ----------
-    n_inliers : int
-        Number of inliers in the data.
-
-    n_samples : int
-        Total number of samples in the data.
-
-    min_samples : int
-        Minimum number of samples chosen randomly from original data.
-
-    probability : float
-        Probability (confidence) that one outlier-free sample is generated.
+    Parameters:
+      n_inliers: Number of inliers in the data.
+      n_samples: Total number of samples in the data.
+      min_samples: Minimum number of samples chosen randomly from original data.
+      probability: Probability (confidence) that one outlier-free sample is generated.
 
     Returns
-    -------
-    trials : int
-        Number of trials.
-
+      trials: Number of trials.
     """
     inlier_ratio = n_inliers / float(n_samples)
     nom = max(_EPSILON, 1 - probability)
@@ -719,8 +724,8 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             y2_inlier_subset = y2[inlier_idxs_subset2]
 
             # Score of inlier datasets
-            score_subset1 = linear_score(X1_inlier_subset, y1_inlier_subset, w1)
-            score_subset2 = linear_score(X2_inlier_subset, y2_inlier_subset, w2)
+            score_subset1 = linear_regression_score(X1_inlier_subset, y1_inlier_subset, w1)
+            score_subset2 = linear_regression_score(X2_inlier_subset, y2_inlier_subset, w2)
             # score_subset1 = base_estimator1.score(X1_inlier_subset,
             #                                       y1_inlier_subset)
             # score_subset2 = base_estimator2.score(X2_inlier_subset,
