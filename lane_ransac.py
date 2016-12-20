@@ -16,12 +16,19 @@ from sklearn.utils.validation import has_fit_parameter
 
 _EPSILON = np.spacing(1)
 
+
 # =========================================================================== #
-# Ransac pre-fitting.
+# Hand implementation of 3x3 and 4x4 inverse: ~3x faster than numpy.linalg.inv
 # =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
 def inverse_3x3(m):
     """Inverse 3x3 matrix. Manual implementation!
+
+    Very basic benchmarks show it's ~3x faster than calling numpy inverse
+    method. Nevertheless, I imagine that much better optimised version exist
+    in the MKL or other library (using SIMD, AVX, and so on).
+    I have no idea how far Numba+LLVM is able to go in terms of optimisation of
+    this code.
     """
     mflat = m.reshape((m.size, ))
     minv = np.zeros_like(mflat)
@@ -39,6 +46,10 @@ def inverse_3x3(m):
     minv[8] = mflat[0] * mflat[4] - mflat[1] * mflat[3]
 
     det = mflat[0] * minv[0] + mflat[1] * minv[3] + mflat[2] * minv[6]
+    # UGGGGGLLLLLLLLYYYYYYYYYY!
+    if np.abs(det) <= _EPSILON:
+        det = 1e-10
+
     det = 1.0 / det
     for i in range(9):
         minv[i] = minv[i] * det
@@ -48,7 +59,7 @@ def inverse_3x3(m):
 
 @numba.jit(nopython=True, nogil=True)
 def inverse_3x3_symmetric(m):
-    """Inverse 3x3 matrix. Manual implementation!
+    """Inverse 3x3 symmetric matrix. Manual implementation!
     """
     mflat = m.reshape((m.size, ))
     minv = np.zeros_like(mflat)
@@ -61,11 +72,15 @@ def inverse_3x3_symmetric(m):
     minv[4] = mflat[0] * mflat[8] - mflat[2] * mflat[6]
     minv[7] = -mflat[0] * mflat[7] + mflat[1] * mflat[6]
 
-    minv[2] = minv[2]
+    minv[2] = minv[6]
     minv[5] = minv[7]
     minv[8] = mflat[0] * mflat[4] - mflat[1] * mflat[3]
 
     det = mflat[0] * minv[0] + mflat[1] * minv[3] + mflat[2] * minv[6]
+    # UGGGGGLLLLLLLLYYYYYYYYYY!
+    if np.abs(det) <= _EPSILON:
+        det = 1e-10
+
     det = 1.0 / det
     for i in range(9):
         minv[i] = minv[i] * det
@@ -227,14 +242,27 @@ def inverse_4x4(m):
     return minv
 
 
+# =========================================================================== #
+# Ransac pre-fitting.
+# =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
-def is_model_valid_simple(w1, w2, diffs, bounds):
-    """Check if a model is valid, based on the regression coefficients.
+def is_model_valid(w1, w2, diffs, bounds):
+    """Check if a model is valid, based on the regression coefficients. Make two
+    different types of checking: difference between left and right lanes AND
+    individual bounds for every lanes.
 
-    Bounds indexes (Nx2 array):
-      0: Origin distance bounds;
-      1: Angle difference bounds;
-      2: Curvature relative differnce bounds;
+    For diffs and bounds parameters: here is the first index meaning:
+      0: Distance between origin points;
+      1: Angle at the origin (in radian);
+      2: Curvature (compute the relative difference between them);
+
+    Params:
+      w1: Coefficient of the 1st fit;
+      w2: Coefficient of the 2nd fit;
+      diffs: Bounds on the difference between left and right lanes;
+      bounds: Bounds on left and right lanes values.
+    Return
+      Is it valid?
     """
     # Distance at the origin.
     dist = w2[0] - w1[0]
@@ -248,14 +276,28 @@ def is_model_valid_simple(w1, w2, diffs, bounds):
     # Relative curvature.
     a1b2 = w1[2] * (1 + w2[1]**2)**1.5
     a2b1 = w2[2] * (1 + w1[1]**2)**1.5
-    rel_curv = (a2b1 - a2b1 + 2*dist*w1[2]*w2[2]) / (a1b2 + a1b2)
-    res = res and np.abs(rel_curv) <= diffs[2]
+    s = a1b2 + a2b1
+    if np.abs(s) > _EPSILON:
+        rel_curv = (a2b1 - a1b2 + 2*dist*w1[2]*w2[2]) / (a1b2 + a2b1)
+        res = res and np.abs(rel_curv) <= diffs[2]
     return res
 
 
 @numba.jit(nopython=True, nogil=True)
-def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds):
+def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_bounds):
     """Construct some pre-fits for Ransac regression.
+
+    Namely: select randomly 4 points, fit a 2nd order curve and then check the
+    validity of the fit. Stop when n_prefits have been found. Note: aim to be
+    much more efficient and fast than standard RANSAC. Could be easily run
+    in parallel on a GPU.
+
+    Params:
+      X1 and y1: Left points;
+      X2 and y2: Right points;
+      n_prefits: Number of pre-fits to generate;
+      is_valid_diffs: Diffs bounds used for checking validity;
+      is_valid_bounds: Bounds used for checking validity.
     """
     shape1 = X1.shape
     shape2 = X2.shape
@@ -265,17 +307,26 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds):
     i = 0
     i1 = 0
     i2 = 0
-
     idxes1 = np.arange(shape1[0])
     idxes2 = np.arange(shape2[0])
+
+    # Initial shuffling of points.
+    # Note: shuffling should be more efficient than random picking.
+    # Processor cache is used much more efficiently like that.
+    np.random.shuffle(idxes1)
+    X1 = X1[idxes1]
+    y1 = y1[idxes1]
+    np.random.shuffle(idxes2)
+    X2 = X2[idxes2]
+    y2 = y2[idxes2]
 
     # Fill the pre-fit arrays...
     while i < n_prefits:
         # Sub-sampling 4 points.
         _X1 = X1[i1:i1+4]
         _y1 = y1[i1:i1+4]
-        _X2 = X1[i2:i2+4]
-        _y2 = y1[i2:i2+4]
+        _X2 = X2[i2:i2+4]
+        _y2 = y2[i2:i2+4]
 
         # Solve linear regression! Hard job :)
         _X1T = _X1.T
@@ -283,13 +334,12 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds):
         w1 = inverse_3x3_symmetric(_X1T @ _X1) @ _X1T @ _y1
         w2 = inverse_3x3_symmetric(_X2T @ _X2) @ _X2T @ _y2
 
-        # Is model basically valid?
-        res = is_model_valid_simple(w1, w2, valid_diffs, valid_bounds)
+        # Is model basically valid? Then save it!
+        res = is_model_valid(w1, w2, is_valid_diffs, is_valid_bounds)
         if res:
             w1_prefits[i] = w1
             w2_prefits[i] = w2
             i += 1
-
         i1 += 1
         i2 += 1
 
@@ -304,21 +354,28 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds):
             X2 = X2[idxes2]
             y2 = y2[idxes2]
             i2 = 0
-
     return w1_prefits, w2_prefits
 
 
 def test_lanes_ransac_prefit(n_prefits=1000):
-    n = n_prefits * 1
+    """Basic test of the lanes RANSAC pre-fit.
+    """
+    n = n_prefits
     X1 = np.random.rand(n, 3)
     X2 = np.random.rand(n, 3)
     y1 = np.random.rand(n)
     y2 = np.random.rand(n)
-
-    valid_diffs = np.ones((3, ), dtype=X1.dtype)
-    valid_bounds = np.ones((3, 2), dtype=X1.dtype)
-
+    valid_diffs = np.ones((3, 2), dtype=X1.dtype)
+    valid_bounds = np.ones((3, 2, 2), dtype=X1.dtype)
     lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, valid_diffs, valid_bounds)
+
+
+def linear_score(X, y, w):
+    y_pred = X @ w
+    u = np.sum((y - y_pred)**2)
+    v = np.sum((y - np.mean(y))**2)
+    score = 1 - u / v
+    return score
 
 
 # =========================================================================== #
@@ -607,6 +664,12 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         y1_inlier_best = None
         y2_inlier_best = None
 
+        best_w1 = None
+        best_w2 = None
+
+        self.w1_ = None
+        self.w2_ = None
+
         # number of data samples
         n_samples1 = X1.shape[0]
         sample_idxs1 = np.arange(n_samples1)
@@ -617,6 +680,10 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             # Linear regression coefficients.
             w1 = w1_prefits[self.n_trials_]
             w2 = w2_prefits[self.n_trials_]
+            base_estimator1.coef_ = w1
+            base_estimator2.coef_ = w2
+            base_estimator1.intercept_ = 0.
+            base_estimator2.intercept_ = 0.
 
             # Predictions on full dataset.
             y_pred1 = X1 @ w1
@@ -652,10 +719,12 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             y2_inlier_subset = y2[inlier_idxs_subset2]
 
             # Score of inlier datasets
-            score_subset1 = base_estimator1.score(X1_inlier_subset,
-                                                  y1_inlier_subset)
-            score_subset2 = base_estimator2.score(X2_inlier_subset,
-                                                  y2_inlier_subset)
+            score_subset1 = linear_score(X1_inlier_subset, y1_inlier_subset, w1)
+            score_subset2 = linear_score(X2_inlier_subset, y2_inlier_subset, w2)
+            # score_subset1 = base_estimator1.score(X1_inlier_subset,
+            #                                       y1_inlier_subset)
+            # score_subset2 = base_estimator2.score(X2_inlier_subset,
+            #                                       y2_inlier_subset)
 
             # same number of inliers but worse score -> skip.
             if (n_inliers_subset1 + n_inliers_subset2 == n_inliers_best1 + n_inliers_best2
@@ -675,15 +744,19 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             X2_inlier_best = X2_inlier_subset
             y2_inlier_best = y2_inlier_subset
 
+            best_w1 = w1
+            best_w2 = w2
+
+
             # break if sufficient number of inliers or score is reached
-            if ((n_inliers_best1 >= self.stop_n_inliers
-                    and n_inliers_best2 >= self.stop_n_inliers)
-                    or (score_best1 >= self.stop_score and score_best2 >= self.stop_score)):
-                    # or self.n_trials_
-                    #    >= _dynamic_max_trials(n_inliers_best, n_samples,
-                    #                           min_samples,
-                    #                           self.stop_probability)):
-                break
+            # if ((n_inliers_best1 >= self.stop_n_inliers
+            #         and n_inliers_best2 >= self.stop_n_inliers)
+            #         or (score_best1 >= self.stop_score and score_best2 >= self.stop_score)):
+            #         # or self.n_trials_
+            #         #    >= _dynamic_max_trials(n_inliers_best, n_samples,
+            #         #                           min_samples,
+            #         #                           self.stop_probability)):
+            #     break
 
         # if none of the iterations met the required criteria
         if inlier_mask_best1 is None or inlier_mask_best2 is None :
@@ -695,13 +768,17 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                 "relaxing the ""constraints.")
 
         # Estimate final model using all inliers
-        base_estimator1.fit(X1_inlier_best, y1_inlier_best)
-        base_estimator2.fit(X2_inlier_best, y2_inlier_best)
+        # base_estimator1.fit(X1_inlier_best, y1_inlier_best)
+        # base_estimator2.fit(X2_inlier_best, y2_inlier_best)
 
         self.estimator1_ = base_estimator1
         self.inlier_mask1_ = inlier_mask_best1
         self.estimator2_ = base_estimator2
         self.inlier_mask2_ = inlier_mask_best2
+
+        self.w1_ = best_w1
+        self.w2_ = best_w2
+
         return self
 
     def predict(self, X1, X2):
@@ -718,7 +795,8 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         y : array, shape = [n_samples] or [n_samples, n_targets]
             Returns predicted values.
         """
-        return self.estimator1_.predict(X1), self.estimator2_.predict(X2)
+        return X1 @ self.w1_, X2 @ self.w2_
+        # return self.estimator1_.predict(X1), self.estimator2_.predict(X2)
 
     def score(self, X1, y1, X2, y2):
         """Returns the score of the prediction.
