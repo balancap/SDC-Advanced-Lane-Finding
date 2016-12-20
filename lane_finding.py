@@ -184,3 +184,105 @@ def load_points(filename, key, dtype=np.float32):
     return data
 
 
+# ============================================================================ #
+# Points / Lanes / Masks...
+# ============================================================================ #
+def masks_to_points(wmasks, add_mask, order=2,
+                    reverse_x=True, normalise=True, dtype=np.float64):
+    """Construct the collection of points from masks.
+    """
+    shape = add_mask.shape
+    x = np.zeros((0,))
+    y = np.zeros((0,))
+    for wm in wmasks:
+        # Left points.
+        x0, y0 = np.where(wm * add_mask)
+        x = np.append(x, x0)
+        y = np.append(y, y0)
+    # Reverse X axis: zero to bottom of image.
+    if reverse_x:
+        x = shape[0] - x - 1
+    if normalise:
+        x = x.astype(dtype) / shape[0]
+        y = y.astype(dtype) / shape[1] - 0.5
+
+    # Construct big vector! Assume order-2 model.
+    X = np.zeros((len(x), order+1), dtype=dtype)
+    X[:, 0] = 1.
+    for i in range(1, order+1):
+        X[:, i] = x**i
+    return X.astype(dtype), y.astype(dtype)
+
+
+def predict_lanes(model_lanes, wimg, order=2,
+                  reversed_x=True, normalised=True, dtype=np.float64):
+    shape = wimg.shape
+    x = np.arange(0, shape[0]).astype(dtype)
+    # Normalise x values.
+    if reversed_x:
+        x = shape[0] - x - 1
+    if normalised:
+        x = x / shape[0]
+
+    # Prediction.
+    X = np.zeros((len(x), order+1), dtype=dtype)
+    X[:, 0] = 1.
+    for i in range(1, order+1):
+        X[:, i] = x**i
+    y1, y2 = model_lanes.predict(X, X)
+
+    # De-normalise!
+    if normalised:
+        x = (x) * shape[0]
+        X = np.vstack((np.ones(shape[0], ), x, x**2)).T
+        y1 = (0.5 + y1) * shape[1]
+        y2 = (0.5 + y2) * shape[1]
+    if reversed_x:
+        x = shape[0] - x - 1
+        X = np.vstack((np.ones(shape[0], ), x, x**2)).T
+
+    return X, y1, y2
+
+
+def lanes_to_wmask(wimg, x1, y1, x2, y2):
+    """Generate the lane mask using left and right lanes.
+    """
+    shape = wimg.shape[0:2]
+
+    # Create an image to draw the lines on
+    warp_zero = np.zeros(shape, np.uint8)
+    color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+
+    # Recast the x and y points into usable format for cv2.fillPoly()
+    pts_left = np.array([np.transpose(np.vstack([y1, x1]))])
+    pts_right = np.array([np.flipud(np.transpose(np.vstack([y2, x2])))])
+    pts = np.hstack((pts_left, pts_right))
+    pts = np.array([pts], dtype=np.int64)
+
+    # Draw the lane onto the warped blank image
+    cv2.fillPoly(color_warp, pts, (0, 255, 0))
+    return color_warp
+
+
+def rescale_coefficients(wimg, w, scaling, normalised=True):
+    """Rescale regression coefficient using a given scaling.
+    """
+    shape = wimg.shape
+    if normalised:
+        scaling = [scaling[0] * shape[0], scaling[1] * shape[1]]
+    # Re-scale coefficients.
+    w_scaled = np.copy(w)
+    w_scaled[0] = w[0] * scaling[1]
+    w_scaled[1] = w[1] * scaling[1] / scaling[0]
+    w_scaled[2] = w[2] * scaling[1] / scaling[0]**2
+    return w_scaled
+
+
+def lane_curvature(w):
+    """Compute curvature from regression coefficients.
+    """
+    if w[2] != 0.:
+        curv = (1 + w[1]**2)**1.5 / (2*w[2])
+    else:
+        curv = np.inf
+    return curv
