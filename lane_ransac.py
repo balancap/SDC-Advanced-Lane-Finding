@@ -287,7 +287,9 @@ def is_model_valid(w1, w2, diffs, bounds):
 
 
 @numba.jit(nopython=True, nogil=True)
-def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_bounds):
+def lanes_ransac_prefit(X1, y1, X2, y2,
+                        n_prefits, max_trials,
+                        is_valid_diffs, is_valid_bounds):
     """Construct some pre-fits for Ransac regression.
 
     Namely: select randomly 4 points, fit a 2nd order curve and then check the
@@ -299,15 +301,19 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_boun
       X1 and y1: Left points;
       X2 and y2: Right points;
       n_prefits: Number of pre-fits to generate;
+      max_trials: Maximum number of trials. No infinity loop!
       is_valid_diffs: Diffs bounds used for checking validity;
       is_valid_bounds: Bounds used for checking validity.
     """
+    min_prefits = 10
+
     shape1 = X1.shape
     shape2 = X2.shape
     w1_prefits = np.zeros((n_prefits, 3), dtype=X1.dtype)
     w2_prefits = np.zeros((n_prefits, 3), dtype=X1.dtype)
 
     i = 0
+    it = 0
     i1 = 0
     i2 = 0
     idxes1 = np.arange(shape1[0])
@@ -324,7 +330,7 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_boun
     y2 = y2[idxes2]
 
     # Fill the pre-fit arrays...
-    while i < n_prefits:
+    while i < n_prefits and (it < max_trials or i < min_prefits):
         # Sub-sampling 4 points.
         _X1 = X1[i1:i1+4]
         _y1 = y1[i1:i1+4]
@@ -343,6 +349,7 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_boun
             i += 1
         i1 += 1
         i2 += 1
+        it += 1
 
         # Get to the end: reshuffle another time!
         if i1 == shape1[0]-3:
@@ -355,6 +362,11 @@ def lanes_ransac_prefit(X1, y1, X2, y2, n_prefits, is_valid_diffs, is_valid_boun
             X2 = X2[idxes2]
             y2 = y2[idxes2]
             i2 = 0
+    # Resize if necessary.
+    if i < n_prefits:
+        w1_prefits = w1_prefits[:i]
+        w2_prefits = w2_prefits[:i]
+
     return w1_prefits, w2_prefits
 
 
@@ -390,7 +402,10 @@ def linear_regression_score(X, y, w):
     y_pred = X @ w
     u = np.sum((y - y_pred)**2)
     v = np.sum((y - np.mean(y))**2)
-    score = 1 - u / v
+    if v > _EPSILON:
+        score = 1 - u / v
+    else:
+        score = -np.inf
     return score
 
 
@@ -688,6 +703,7 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         # Allows to quickly pre-select some good configurations.
         w1_prefits, w2_prefits = lanes_ransac_prefit(X1, y1, X2, y2,
                                                      self.n_prefits,
+                                                     self.max_trials,
                                                      self.is_valid_diffs,
                                                      self.is_valid_bounds)
 
