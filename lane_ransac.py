@@ -395,7 +395,93 @@ def linear_regression_score(X, y, w):
 
 
 # =========================================================================== #
-# Main Ransac implementation.
+# Ransac Regression: best fit selection.
+# =========================================================================== #
+@numba.jit(nopython=True, nogil=True)
+def ransac_absolute_loss(y_true, y_pred):
+    return np.abs(y_true - y_pred)
+
+
+@numba.jit(nopython=True, nogil=True)
+def lanes_ransac_select_best(X1, y1, X2, y2, w1_prefits, w2_prefits,
+                             residual_threshold):
+    n_prefits = w1_prefits.shape[0]
+
+    # Best match variables.
+    n_inliers_best1 = 0
+    n_inliers_best2 = 0
+    score_best1 = np.inf
+    score_best2 = np.inf
+    inlier_mask_best1 = (y1 == np.inf)
+    inlier_mask_best2 = (y2 == np.inf)
+
+    best_w1 = w1_prefits[0]
+    best_w2 = w2_prefits[0]
+
+    # Number of data samples
+    n_samples1 = X1.shape[0]
+    sample_idxs1 = np.arange(n_samples1)
+    n_samples2 = X2.shape[0]
+    sample_idxs2 = np.arange(n_samples2)
+
+    for i in range(n_prefits):
+        # Predictions on the dataset.
+        w1 = w1_prefits[i]
+        w2 = w2_prefits[i]
+        y_pred1 = X1 @ w1
+        y_pred2 = X2 @ w2
+
+        # Inliers / outliers masks
+        residuals_subset1 = np.abs(y1 - y_pred1)
+        residuals_subset2 = np.abs(y2 - y_pred2)
+
+        # classify data into inliers and outliers
+        inlier_mask_subset1 = residuals_subset1 < residual_threshold
+        n_inliers_subset1 = np.sum(inlier_mask_subset1)
+        inlier_mask_subset2 = residuals_subset2 < residual_threshold
+        n_inliers_subset2 = np.sum(inlier_mask_subset2)
+
+        # less inliers -> skip current random sample
+        if n_inliers_subset1 + n_inliers_subset2 < n_inliers_best1 + n_inliers_best2:
+            continue
+        if n_inliers_subset1 == 0 or n_inliers_subset2 == 0:
+            continue
+
+        # extract inlier data set
+        inlier_idxs_subset1 = sample_idxs1[inlier_mask_subset1]
+        X1_inlier_subset = X1[inlier_idxs_subset1]
+        y1_inlier_subset = y1[inlier_idxs_subset1]
+
+        inlier_idxs_subset2 = sample_idxs2[inlier_mask_subset2]
+        X2_inlier_subset = X2[inlier_idxs_subset2]
+        y2_inlier_subset = y2[inlier_idxs_subset2]
+
+        # Score of inlier datasets
+        score_subset1 = linear_regression_score(X1_inlier_subset, y1_inlier_subset, w1)
+        score_subset2 = linear_regression_score(X2_inlier_subset, y2_inlier_subset, w2)
+
+        # same number of inliers but worse score -> skip.
+        if (n_inliers_subset1 + n_inliers_subset2 == n_inliers_best1 + n_inliers_best2
+                and score_subset1 + score_subset2 < score_best1 + score_best2):
+            continue
+
+        # Save current random sample as best sample
+        n_inliers_best1 = n_inliers_subset1
+        score_best1 = score_subset1
+        inlier_mask_best1 = inlier_mask_subset1
+
+        n_inliers_best2 = n_inliers_subset2
+        score_best2 = score_subset2
+        inlier_mask_best2 = inlier_mask_subset2
+
+        best_w1 = w1
+        best_w2 = w2
+
+    return best_w1, best_w2, inlier_mask_best1, inlier_mask_best2
+
+
+# =========================================================================== #
+# Main Ransac Regression class. Scikit-inspired implementation.
 # =========================================================================== #
 def _dynamic_max_trials(n_inliers, n_samples, min_samples, probability):
     """Determine number trials such that at least one outlier-free subset is
@@ -544,281 +630,110 @@ class LanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
     .. [3] http://www.bmva.org/bmvc/2009/Papers/Paper355/Paper355.pdf
     """
 
-    def __init__(self, base_estimator=None,
-                 min_samples=None,
+    def __init__(self,
                  residual_threshold=None,
-                 is_data_valid=None, is_model_valid=None,
-                 n_prefits=1000, max_trials=100,
-                 valid_diffs=None, valid_bounds=None,
-                 stop_n_inliers=np.inf, stop_score=np.inf,
-                 stop_probability=0.99, residual_metric=None,
-                 loss='absolute_loss', random_state=None):
+                 n_prefits=1000,
+                 max_trials=100,
+                 is_valid_diffs=None,
+                 is_valid_bounds=None,
+                 stop_n_inliers=np.inf,
+                 stop_score=np.inf,
+                 stop_probability=0.99,
+                 random_state=None):
 
-        self.base_estimator = base_estimator
-        self.min_samples = min_samples
         self.residual_threshold = residual_threshold
 
-        self.is_data_valid = is_data_valid
-        self.is_model_valid = is_model_valid
         self.n_prefits = n_prefits
         self.max_trials = max_trials
-        self.valid_diffs = valid_diffs
-        self.valid_bounds = valid_bounds
+        self.is_valid_diffs = is_valid_diffs
+        self.is_valid_bounds = is_valid_bounds
 
         self.stop_n_inliers = stop_n_inliers
         self.stop_score = stop_score
         self.stop_probability = stop_probability
-        self.residual_metric = residual_metric
         self.random_state = random_state
-        self.loss = loss
 
-    def fit(self, X1, y1, X2, y2, sample_weight=None):
+    def fit(self, X1, y1, X2, y2):
         """Fit estimator using RANSAC algorithm.
+
+        Namely, the fit is done into two main steps:
+        - pre-fitting: quickly select n_prefits configurations which seems
+        suitable given topological constraints.
+        - finding best fit: select the pre-fit with the maximum number of inliers
+        as the best fit.
+
+        Inputs:
+          X1, y1: Left lane points (supposedly)
+          X2, y2: Right lane points (supposedly)
         """
-        # X = check_array(X, accept_sparse='csr')
-        # y = check_array(y, ensure_2d=False)
         check_consistent_length(X1, y1)
         check_consistent_length(X2, y2)
 
-        if self.base_estimator is not None:
-            base_estimator1 = clone(self.base_estimator)
-            base_estimator2 = clone(self.base_estimator)
-        else:
-            base_estimator1 = LinearRegression()
-            base_estimator2 = LinearRegression()
-
-        # assume linear model by default
-        if self.min_samples is None:
-            min_samples = X1.shape[1] + 1
-        elif 0 < self.min_samples < 1:
-            min_samples = np.ceil(self.min_samples * X1.shape[0])
-        elif self.min_samples >= 1:
-            if self.min_samples % 1 != 0:
-                raise ValueError("Absolute number of samples must be an "
-                                 "integer value.")
-            min_samples = self.min_samples
-        else:
-            raise ValueError("Value for `min_samples` must be scalar and "
-                             "positive.")
+        # Assume linear model by default
+        min_samples = X1.shape[1] + 1
         if min_samples > X1.shape[0] or min_samples > X2.shape[0]:
             raise ValueError("`min_samples` may not be larger than number "
                              "of samples ``X1-2.shape[0]``.")
 
+        # Check additional parameters...
         if self.stop_probability < 0 or self.stop_probability > 1:
             raise ValueError("`stop_probability` must be in range [0, 1].")
-
         if self.residual_threshold is None:
-            # MAD (median absolute deviation)
             residual_threshold = np.median(np.abs(y - np.median(y)))
         else:
             residual_threshold = self.residual_threshold
+        # random_state = check_random_state(self.random_state)
 
-        if self.loss == "absolute_loss":
-            if y1.ndim == 1:
-                loss_function = lambda y_true, y_pred: np.abs(y_true - y_pred)
-            else:
-                loss_function = lambda \
-                    y_true, y_pred: np.sum(np.abs(y_true - y_pred), axis=1)
-        elif self.loss == "squared_loss":
-            if y1.ndim == 1:
-                loss_function = lambda y_true, y_pred: (y_true - y_pred) ** 2
-            else:
-                loss_function = lambda \
-                    y_true, y_pred: np.sum((y_true - y_pred) ** 2, axis=1)
-        elif callable(self.loss):
-            loss_function = self.loss
-        else:
-            raise ValueError(
-                "loss should be 'absolute_loss', 'squared_loss' or a callable."
-                "Got %s. " % self.loss)
-
-
-        random_state = check_random_state(self.random_state)
-        try:  # Not all estimator accept a random_state
-            base_estimator1.set_params(random_state=random_state)
-            base_estimator2.set_params(random_state=random_state)
-        except ValueError:
-            pass
-
-        estimator_fit_has_sample_weight = has_fit_parameter(base_estimator1,
-                                                            "sample_weight")
-        estimator_name = type(base_estimator1).__name__
-        if (sample_weight is not None and not estimator_fit_has_sample_weight):
-            raise ValueError("%s does not support sample_weight. Samples"
-                             " weights are only used for the calibration"
-                             " itself." % estimator_name)
-        if sample_weight is not None:
-            sample_weight = np.asarray(sample_weight)
-
-        # Pre-fit with small subsets (4 points).
+        # === Pre-fit with small subsets (4 points) === #
         # Allows to quickly pre-select some good configurations.
         w1_prefits, w2_prefits = lanes_ransac_prefit(X1, y1, X2, y2,
                                                      self.n_prefits,
-                                                     self.valid_diffs,
-                                                     self.valid_bounds)
+                                                     self.is_valid_diffs,
+                                                     self.is_valid_bounds)
 
-        # Best match variables.
-        n_inliers_best1 = 0
-        n_inliers_best2 = 0
-        score_best1 = np.inf
-        score_best2 = np.inf
-        inlier_mask_best1 = None
-        inlier_mask_best2 = None
-        X1_inlier_best = None
-        X2_inlier_best = None
-        y1_inlier_best = None
-        y2_inlier_best = None
+        # === Select best pre-fit, using the full dataset === #
+        (w1,
+         w2,
+         inlier_mask1,
+         inlier_mask2) = lanes_ransac_select_best(X1, y1, X2, y2,
+                                                  w1_prefits, w2_prefits,
+                                                  residual_threshold)
+        self.w1_ = w1
+        self.w2_ = w2
 
-        best_w1 = None
-        best_w2 = None
+        # Set regression parameters.
+        base_estimator1 = LinearRegression(fit_intercept=False)
+        base_estimator1.coef_ = w1
+        base_estimator1.intercept_ = 0.0
+        base_estimator2 = LinearRegression(fit_intercept=False)
+        base_estimator2.coef_ = w2
+        base_estimator2.intercept_ = 0.0
 
-        self.w1_ = None
-        self.w2_ = None
-
-        # number of data samples
-        n_samples1 = X1.shape[0]
-        sample_idxs1 = np.arange(n_samples1)
-        n_samples2 = X2.shape[0]
-        sample_idxs2 = np.arange(n_samples2)
-
-        for self.n_trials_ in range(0, self.n_prefits):
-            # Linear regression coefficients.
-            w1 = w1_prefits[self.n_trials_]
-            w2 = w2_prefits[self.n_trials_]
-            base_estimator1.coef_ = w1
-            base_estimator2.coef_ = w2
-            base_estimator1.intercept_ = 0.
-            base_estimator2.intercept_ = 0.
-
-            # Predictions on full dataset.
-            y_pred1 = X1 @ w1
-            y_pred2 = X2 @ w2
-            # y_pred1 = base_estimator1.predict(X1)
-            # y_pred2 = base_estimator2.predict(X2)
-
-            residuals_subset1 = loss_function(y1, y_pred1)
-            residuals_subset2 = loss_function(y2, y_pred2)
-
-            # classify data into inliers and outliers
-            inlier_mask_subset1 = residuals_subset1 < residual_threshold
-            n_inliers_subset1 = np.sum(inlier_mask_subset1)
-            inlier_mask_subset2 = residuals_subset2 < residual_threshold
-            n_inliers_subset2 = np.sum(inlier_mask_subset2)
-
-            # less inliers -> skip current random sample
-            if n_inliers_subset1 + n_inliers_subset2 < n_inliers_best1 + n_inliers_best2:
-                continue
-            if n_inliers_subset1 == 0 or n_inliers_subset2 == 0:
-                continue
-                # raise ValueError("No inliers found, possible cause is "
-                #     "setting residual_threshold ({0}) too low.".format(
-                #     self.residual_threshold))
-
-            # extract inlier data set
-            inlier_idxs_subset1 = sample_idxs1[inlier_mask_subset1]
-            X1_inlier_subset = X1[inlier_idxs_subset1]
-            y1_inlier_subset = y1[inlier_idxs_subset1]
-
-            inlier_idxs_subset2 = sample_idxs2[inlier_mask_subset2]
-            X2_inlier_subset = X2[inlier_idxs_subset2]
-            y2_inlier_subset = y2[inlier_idxs_subset2]
-
-            # Score of inlier datasets
-            score_subset1 = linear_regression_score(X1_inlier_subset, y1_inlier_subset, w1)
-            score_subset2 = linear_regression_score(X2_inlier_subset, y2_inlier_subset, w2)
-            # score_subset1 = base_estimator1.score(X1_inlier_subset,
-            #                                       y1_inlier_subset)
-            # score_subset2 = base_estimator2.score(X2_inlier_subset,
-            #                                       y2_inlier_subset)
-
-            # same number of inliers but worse score -> skip.
-            if (n_inliers_subset1 + n_inliers_subset2 == n_inliers_best1 + n_inliers_best2
-                    and score_subset1 + score_subset2 < score_best1 + score_best2):
-                continue
-
-            # save current random sample as best sample
-            n_inliers_best1 = n_inliers_subset1
-            score_best1 = score_subset1
-            inlier_mask_best1 = inlier_mask_subset1
-            X1_inlier_best = X1_inlier_subset
-            y1_inlier_best = y1_inlier_subset
-
-            n_inliers_best2 = n_inliers_subset2
-            score_best2 = score_subset2
-            inlier_mask_best2 = inlier_mask_subset2
-            X2_inlier_best = X2_inlier_subset
-            y2_inlier_best = y2_inlier_subset
-
-            best_w1 = w1
-            best_w2 = w2
-
-
-            # break if sufficient number of inliers or score is reached
-            # if ((n_inliers_best1 >= self.stop_n_inliers
-            #         and n_inliers_best2 >= self.stop_n_inliers)
-            #         or (score_best1 >= self.stop_score and score_best2 >= self.stop_score)):
-            #         # or self.n_trials_
-            #         #    >= _dynamic_max_trials(n_inliers_best, n_samples,
-            #         #                           min_samples,
-            #         #                           self.stop_probability)):
-            #     break
-
-        # if none of the iterations met the required criteria
-        if inlier_mask_best1 is None or inlier_mask_best2 is None :
-            raise ValueError(
-                "RANSAC could not find valid consensus set, because"
-                " either the `residual_threshold` rejected all the samples or"
-                " `is_data_valid` and `is_model_valid` returned False for all"
-                " `max_trials` randomly ""chosen sub-samples. Consider "
-                "relaxing the ""constraints.")
-
-        # Estimate final model using all inliers
-        # base_estimator1.fit(X1_inlier_best, y1_inlier_best)
-        # base_estimator2.fit(X2_inlier_best, y2_inlier_best)
-
+        # Save final model parameters.
         self.estimator1_ = base_estimator1
-        self.inlier_mask1_ = inlier_mask_best1
         self.estimator2_ = base_estimator2
-        self.inlier_mask2_ = inlier_mask_best2
 
-        self.w1_ = best_w1
-        self.w2_ = best_w2
+        self.inlier_mask1_ = inlier_mask1
+        self.inlier_mask2_ = inlier_mask2
+
+        # # Estimate final model using all inliers
+        # # base_estimator1.fit(X1_inlier_best, y1_inlier_best)
+        # # base_estimator2.fit(X2_inlier_best, y2_inlier_best)
 
         return self
 
     def predict(self, X1, X2):
-        """Predict using the estimated model.
-
-        This is a wrapper for `estimator_.predict(X)`.
+        """Predict`lanes using the estimated model.
 
         Parameters
-        ----------
-        X : numpy array of shape [n_samples, n_features]
-
+          X1, X2.
         Returns
-        -------
-        y : array, shape = [n_samples] or [n_samples, n_targets]
-            Returns predicted values.
+          y1, y2
         """
         return X1 @ self.w1_, X2 @ self.w2_
         # return self.estimator1_.predict(X1), self.estimator2_.predict(X2)
 
     def score(self, X1, y1, X2, y2):
         """Returns the score of the prediction.
-
-        This is a wrapper for `estimator_.score(X, y)`.
-
-        Parameters
-        ----------
-        X : numpy array or sparse matrix of shape [n_samples, n_features]
-            Training data.
-
-        y : array, shape = [n_samples] or [n_samples, n_targets]
-            Target values.
-
-        Returns
-        -------
-        z : float
-            Score of the prediction.
         """
         return self.estimator1_.score(X1, y1) + self.estimator1_.score(X2, y2)
