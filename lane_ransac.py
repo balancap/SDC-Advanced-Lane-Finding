@@ -387,6 +387,17 @@ def test_lanes_ransac_prefit(n_prefits=1000):
 # Linear Regression: some optimised methods.
 # =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
+def linear_regression_fit(X, y):
+    """Linear Regression: fit X and y.
+    Very basic implementation based on inversing X.T @ X. Enough in low
+    dimensions.
+    """
+    XT = X.T
+    w = np.linalg.inv(XT @ X) @ XT @ y
+    return w
+
+
+@numba.jit(nopython=True, nogil=True)
 def linear_regression_predict(X, w):
     """Linear Regression: predicted y from X and w.
     """
@@ -491,6 +502,30 @@ def lanes_ransac_select_best(X1, y1, X2, y2, w1_prefits, w2_prefits,
 
         best_w1 = w1
         best_w2 = w2
+
+    # Final fit: quick iterations to converge.
+    for i in range(5):
+        best_w1 = linear_regression_fit(X1_inlier_subset, y1_inlier_subset)
+        best_w2 = linear_regression_fit(X2_inlier_subset, y2_inlier_subset)
+        y_pred1 = X1 @ best_w1
+        y_pred2 = X2 @ best_w2
+
+        # Inliers / outliers masks
+        residuals_subset1 = np.abs(y1 - y_pred1)
+        residuals_subset2 = np.abs(y2 - y_pred2)
+
+        # classify data into inliers and outliers
+        inlier_mask_best1 = residuals_subset1 < residual_threshold
+        inlier_mask_best2 = residuals_subset2 < residual_threshold
+
+        inlier_idxs_subset1 = sample_idxs1[inlier_mask_best1]
+        X1_inlier_subset = X1[inlier_idxs_subset1]
+        y1_inlier_subset = y1[inlier_idxs_subset1]
+
+        inlier_idxs_subset2 = sample_idxs2[inlier_mask_best2]
+        X2_inlier_subset = X2[inlier_idxs_subset2]
+        y2_inlier_subset = y2[inlier_idxs_subset2]
+
 
     return best_w1, best_w2, inlier_mask_best1, inlier_mask_best2
 
