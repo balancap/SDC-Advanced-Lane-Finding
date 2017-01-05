@@ -188,7 +188,7 @@ def load_points(filename, key, dtype=np.float32):
 # Points / Lanes / Masks...
 # ============================================================================ #
 def masks_to_points(wmasks, add_mask, order=2,
-                    reverse_x=True, normalise=True, dtype=np.float64):
+                    reverse_x=True, normalise=True, dtype=np.float32):
     """Construct the collection of points from masks.
     """
     shape = add_mask.shape
@@ -215,7 +215,7 @@ def masks_to_points(wmasks, add_mask, order=2,
 
 
 def predict_lanes(model_lanes, wimg, order=2,
-                  reversed_x=True, normalised=True, dtype=np.float64):
+                  reversed_x=True, normalised=True, dtype=np.float32):
     shape = wimg.shape
     x = np.arange(0, shape[0]).astype(dtype)
     # Normalise x values.
@@ -230,6 +230,37 @@ def predict_lanes(model_lanes, wimg, order=2,
     for i in range(1, order+1):
         X[:, i] = x**i
     y1, y2 = model_lanes.predict(X, X)
+
+    # De-normalise!
+    if normalised:
+        x = (x) * shape[0]
+        X = np.vstack((np.ones(shape[0], ), x, x**2)).T
+        y1 = (0.5 + y1) * shape[1]
+        y2 = (0.5 + y2) * shape[1]
+    if reversed_x:
+        x = shape[0] - x - 1
+        X = np.vstack((np.ones(shape[0], ), x, x**2)).T
+
+    return X, y1, y2
+
+
+def predict_lanes_w(w1, w2, wimg, order=2,
+                    reversed_x=True, normalised=True, dtype=np.float32):
+    shape = wimg.shape
+    x = np.arange(0, shape[0]).astype(dtype)
+    # Normalise x values.
+    if reversed_x:
+        x = shape[0] - x - 1
+    if normalised:
+        x = x / shape[0]
+
+    # Prediction.
+    X = np.zeros((len(x), order+1), dtype=dtype)
+    X[:, 0] = 1.
+    for i in range(1, order+1):
+        X[:, i] = x**i
+    y1 = X @ w1
+    y2 = X @ w2
 
     # De-normalise!
     if normalised:

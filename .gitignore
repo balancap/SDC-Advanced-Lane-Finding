@@ -3,3 +3,5 @@
 .ipynb_checkpoints/
 debug/
 __pycache__/
+.~advanced-lane-finding.ipynb
+debug_frames/
