@@ -531,6 +531,7 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         (w_left1, in_mask_left1) = lanes_ransac_select_best(X1, y1,
                                                             w_left_prefits,
                                                             residual_threshold)
+        n_inliers_left1 = np.sum(in_mask_left1)
         w_refs = np.vstack((self.w_refs_right, np.reshape(w_left1, (1, 3))))
         is_valid_bounds = np.vstack((self.is_valid_bounds_right, left_right_bounds))
         w_right_prefits = lanes_ransac_prefit(X2, y2,
@@ -541,7 +542,8 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         (w_right1, in_mask_right1) = lanes_ransac_select_best(X2, y2,
                                                               w_right_prefits,
                                                               residual_threshold)
-        n_inliers1 = np.sum(in_mask_left1) + np.sum(in_mask_right1)
+        n_inliers_right1 = np.sum(in_mask_right1)
+        n_inliers1 = n_inliers_right1 + n_inliers_left1
 
         # === Right lane and then left lane === #
         w_right_prefits = lanes_ransac_prefit(X2, y2,
@@ -552,6 +554,7 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         (w_right2, in_mask_right2) = lanes_ransac_select_best(X2, y2,
                                                               w_right_prefits,
                                                               residual_threshold)
+        n_inliers_right2 = np.sum(in_mask_right2)
         w_refs = np.vstack((self.w_refs_left, np.reshape(w_right2, (1, 3))))
         is_valid_bounds = np.vstack((self.is_valid_bounds_left, left_right_bounds))
         w_left_prefits = lanes_ransac_prefit(X1, y1,
@@ -562,7 +565,8 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         (w_left2, in_mask_left2) = lanes_ransac_select_best(X1, y1,
                                                             w_left_prefits,
                                                             residual_threshold)
-        n_inliers2 = np.sum(in_mask_left2) + np.sum(in_mask_right2)
+        n_inliers_left2 = np.sum(in_mask_left2)
+        n_inliers2 = n_inliers_right2 + n_inliers_left2
 
         # Best fit?
         if n_inliers1 < n_inliers2:
