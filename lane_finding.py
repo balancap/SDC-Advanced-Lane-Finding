@@ -25,7 +25,8 @@ def plot_images(imgs, titles, cmap='gray', figsize=(24, 9)):
 
 
 def plot_dual(img1, img2, title1='', title2='', figsize=(24, 9)):
-
+    """Plot two images side by side.
+    """
     f, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
     f.tight_layout()
     ax1.imshow(img1)
@@ -56,6 +57,8 @@ def draw_mask(img, mask, color=[255, 0, 0], alpha=0.8, beta=1., gamma=0.):
 # Calibration methods.
 # =========================================================================== #
 def undistort_image(img, mtx, dist):
+    """Undistort an image.
+    """
     return cv2.undistort(img, mtx, dist, None, mtx)
 
 
@@ -88,7 +91,6 @@ def calibration_parameters(path, cshape):
             imgpoints.append(corners)
         else:
             print('Warning! Not chessboard found in image', fname)
-
     # Calibration from image points.
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(objpoints,
                                                        imgpoints,
@@ -127,6 +129,8 @@ def apply_scaling(x, y, scale, shape, reversed_x=True, dtype=np.float32):
 
 
 def warp_image(img, mtx_perp, flags=cv2.INTER_LINEAR):
+    """Warp an image using a transform matrix.
+    """
     img_size = (img.shape[1], img.shape[0])
     return cv2.warpPerspective(img, mtx_perp, img_size, flags=cv2.INTER_LINEAR)
 
@@ -152,7 +156,6 @@ def test_perspective(img, src_points, mtx_perp):
 
     # Apply transform.
     wimg = warp_image(img, mtx_perp, flags=cv2.INTER_LINEAR)
-    # unwimg = cv2.warpPerspective(wimg, m_inv_perp, img_size, flags=cv2.INTER_LINEAR)
     # Plot result.
     plot_dual(img, wimg,
               title1='Original image.',
@@ -184,8 +187,183 @@ def load_points(filename, key, dtype=np.float32):
     return data
 
 
+# =========================================================================== #
+# Gradients and lanes masks computations.
+# =========================================================================== #
+def adjust_gamma(image, gamma=1.0):
+    # build a lookup table mapping the pixel values [0, 255] to
+    # their adjusted gamma values
+    invGamma = 1.0 / gamma
+    table = np.array([((i / 255.0) ** invGamma) * 255
+                      for i in np.arange(0, 256)]).astype("uint8")
+
+    # apply gamma correction using the lookup table
+    return cv2.LUT(image, table)
+
+
+def gradient_magnitude(gray, sobel_kernel=3):
+    """Compute mask based on gradient magnitude. Input image assumed
+    to be two dimensional.
+    """
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=sobel_kernel)
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=sobel_kernel)
+    # Norm and rescaling (c.f. different kernel sizes)
+    gradmag = np.sqrt(sobelx**2 + sobely**2)
+    scale_factor = np.max(gradmag) / 255.
+    gradmag = (gradmag / scale_factor)
+    return gradmag
+
+
+def gradient_x(gray, sobel_kernel=3):
+    """Compute mask based on horizontal gradient. Input image assumed
+    to be two dimensional.
+    """
+    sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=sobel_kernel)
+    gradmag = sobelx
+    scale_factor = np.max(gradmag) / 255.
+    gradmag = (gradmag / scale_factor)
+    return gradmag
+
+
+def gradient_y(gray, sobel_kernel=3):
+    """Compute mask based on horizontal gradient. Input image assumed
+    to be two dimensional.
+    """
+    sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=sobel_kernel)
+    gradmag = sobely
+    scale_factor = np.max(gradmag) / 255.
+    gradmag = (gradmag / scale_factor)
+    return gradmag
+
+
+def mask_local_crossing_x(gray, threshold=20, dilate_kernel=(2, 6), iterations=3):
+    # Increasing mask.
+    mask_neg = (gray < -threshold).astype(np.float32)
+    mask_pos = (gray > threshold).astype(np.float32)
+
+    mid = dilate_kernel[1] // 2
+    # Dilate mask to the left.
+    kernel = np.ones(dilate_kernel, np.uint8)
+    kernel[:, 0:mid] = 0
+    dmask_neg = cv2.dilate(mask_neg, kernel, iterations=iterations) > 0.
+    # Dilate mask to the right.
+    kernel = np.ones(dilate_kernel, np.uint8)
+    kernel[:, mid:] = 0
+    dmask_pos = cv2.dilate(mask_pos, kernel, iterations=iterations) > 0.
+    dmask = (dmask_pos * dmask_neg).astype(np.uint8)
+
+    # Eroding a bit
+    # kernel = np.ones((1,2),np.uint8)
+    # dmask = cv2.erode(dmask, kernel, iterations=5)
+    return dmask
+
+
+def mask_threshold(gray, threshold=(0, 255)):
+    mask = np.zeros_like(gray)
+    mask[(gray >= threshold[0]) & (gray <= threshold[1])] = 1
+    return mask
+
+
+def color_threshold(gray, threshold=(0, 255)):
+    mask = np.zeros_like(gray)
+    mask[(gray >= threshold[0]) & (gray <= threshold[1])] = 1
+    return mask
+
+
+def canny(img, low_threshold, high_threshold):
+    """Applies the Canny transform"""
+    return cv2.Canny(img, low_threshold, high_threshold)
+
+
+def gaussian_blur(img, kernel_size):
+    """Applies a Gaussian Noise kernel"""
+    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
+
+
+def warped_masks_original(img, m_perp, thresholds=[20, 25]):
+    """Generate a collection of masks useful to detect lines.
+    Original definition, calculating gradients and then apply transform.
+    """
+    wmasks = []
+    # Grayscale and HSL images
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    hsl = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)
+
+#     gammas = [0.3, 1., 3.]
+    gammas = [1.]
+    for g in gammas:
+        # img_gamma = adjust_gamma(img, gamma=g)
+
+        # Compute gradients.
+        skernel = 13
+        sobel_dx = gradient_x(gray, sobel_kernel=skernel)
+        s_sobel_dx = gradient_x(hsl[:, :, 2], sobel_kernel=skernel)
+
+        # Warped gradients.
+        wsobel_dx = warp_image(sobel_dx, m_perp, flags=cv2.INTER_LANCZOS4)
+        ws_sobel_dx = warp_image(s_sobel_dx, m_perp, flags=cv2.INTER_LANCZOS4)
+
+        # Try to detect gradients configuration corresponding to lanes.
+        mask = mask_local_crossing_x(wsobel_dx, threshold=thresholds[0],
+                                     dilate_kernel=(2, 8), iterations=3)
+        wmasks.append(mask)
+        mask = mask_local_crossing_x(ws_sobel_dx, threshold=thresholds[1],
+                                     dilate_kernel=(2, 8), iterations=3)
+        wmasks.append(mask)
+
+    return wmasks
+
+
+def warped_masks(img, m_perp, thresholds=[20, 25]):
+    """Generate a collection of masks useful to detect lines.
+    """
+    wmasks = []
+    # Grayscale and HSL images
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    hsl = cv2.cvtColor(img, cv2.COLOR_RGB2HLS)
+
+#     gammas = [0.3, 1., 3.]
+    gammas = [1.]
+    for g in gammas:
+        img_gamma = adjust_gamma(img, gamma=g)
+        # Warped images.
+        wimg = warp_image(img_gamma, m_perp, flags=cv2.INTER_LANCZOS4)
+        wgray = cv2.cvtColor(wimg, cv2.COLOR_RGB2GRAY)
+        whsl = cv2.cvtColor(wimg, cv2.COLOR_RGB2HLS)
+
+        # Compute gradients.
+        skernel = 13
+        wsobel_dx = gradient_x(wgray, sobel_kernel=skernel)
+        ws_sobel_dx = gradient_x(whsl[:, :, 2], sobel_kernel=skernel)
+
+        # Try to detect gradients configuration corresponding to lanes.
+        mask = mask_local_crossing_x(wsobel_dx, threshold=thresholds[0],
+                                     dilate_kernel=(2, 8), iterations=3)
+        wmasks.append(mask)
+        mask = mask_local_crossing_x(ws_sobel_dx, threshold=thresholds[1],
+                                     dilate_kernel=(2, 8), iterations=3)
+        wmasks.append(mask)
+
+    return wmasks
+
+
+def default_left_right_masks(img, margin=0.1):
+    """Default left and right masks used to find lanes: middle split with some additional margin.
+    """
+    shape = img.shape[0:2]
+    llimit = int(shape[1] / 2 + shape[1] * margin)
+    rlimit = int(shape[1] / 2 - shape[1] * margin)
+
+    # Mask from meshgrid.
+    xv, yv = np.mgrid[0:shape[0], 0:shape[1]]
+    lmask = yv <= llimit
+    rmask = yv >= rlimit
+
+    return lmask, rmask
+
+
 # ============================================================================ #
-# Points / Lanes / Masks...
+# Points / Lanes / Masks transforms.
 # ============================================================================ #
 def masks_to_points(wmasks, add_mask, order=2,
                     reverse_x=True, normalise=True, dtype=np.float32):
@@ -216,6 +394,8 @@ def masks_to_points(wmasks, add_mask, order=2,
 
 def predict_lanes(model_lanes, wimg, order=2,
                   reversed_x=True, normalised=True, dtype=np.float32):
+    """Predict lanes using regression coefficients.
+    """
     shape = wimg.shape
     x = np.arange(0, shape[0]).astype(dtype)
     # Normalise x values.
@@ -230,7 +410,6 @@ def predict_lanes(model_lanes, wimg, order=2,
     for i in range(1, order+1):
         X[:, i] = x**i
     y1, y2 = model_lanes.predict(X, X)
-
     # De-normalise!
     if normalised:
         x = (x) * shape[0]
@@ -246,6 +425,8 @@ def predict_lanes(model_lanes, wimg, order=2,
 
 def predict_lanes_w(w1, w2, wimg, order=2,
                     reversed_x=True, normalised=True, dtype=np.float32):
+    """Predict lanes using regression coefficients.
+    """
     shape = wimg.shape
     x = np.arange(0, shape[0]).astype(dtype)
     # Normalise x values.
@@ -261,7 +442,6 @@ def predict_lanes_w(w1, w2, wimg, order=2,
         X[:, i] = x**i
     y1 = X @ w1
     y2 = X @ w2
-
     # De-normalise!
     if normalised:
         x = (x) * shape[0]
@@ -317,3 +497,77 @@ def lane_curvature(w):
     else:
         curv = np.inf
     return curv
+
+
+class LanesFit():
+    """Lanes fit class: contain information on a previous fit of lanes.
+    """
+    def __init__(self):
+        # Interpolation coefficients.
+        self.w_left = np.zeros((3,), dtype=np.float32)
+        self.w_right = np.zeros((3,), dtype=np.float32)
+        # Fitting score.
+        self.fit_score_left = 0.0
+        self.fit_score_right = 0.0
+
+        # Scaling and original shape.
+        self.shape = (1, 1)
+        self.scaling = (1., 1.)
+        self.shift = (0., 0.5)
+        self.reversed = True
+
+        # Radius of curvature, in w units.
+        self.radius = 0.0
+        self.line_base_pos = 0.0
+
+    def init_from_regressor(self, regr):
+        """Initialise values from a regression object.
+        """
+        self.w_left = regr.w1_
+        self.w_right = regr.w2_
+        self.fit_score_left = float(np.sum(regr.inlier_mask1_)) / regr.inlier_mask1_.size
+        self.fit_score_right = float(np.sum(regr.inlier_mask2_)) / regr.inlier_mask2_.size
+
+    def translate_coefficients(self, delta):
+        """Translate lanes while keeping same curvature center.
+        """
+        w_left = self.w_left
+        w1 = np.copy(self.w_left)
+        w1[0] = delta + w_left[0]
+        w1[1] = w_left[1]
+        w1[2] = w_left[2] * (1 + w_left[1]**2)**1.5 / ((1 + w_left[1]**2)**1.5 - 2*delta*w_left[2])
+
+        w_right = self.w_right
+        w2 = np.copy(self.w_right)
+        w2[0] = delta + w_right[0]
+        w2[1] = w_right[1]
+        w2[2] = w_right[2] * (1 + w_right[1]**2)**1.5 / ((1 + w_right[1]**2)**1.5 - 2*delta*w_right[2])
+        return w1, w2
+
+    def masks(self, delta):
+        """Compute lanes mask, using a +- delta on every lane.
+        """
+        delta = np.abs(delta)
+        # Meshgrid
+        xv, yv = np.mgrid[0:self.shape[0], 0:self.shape[1]]
+        xv = xv / float(self.scaling[0]) - self.shift[0]
+        yv = yv / float(self.scaling[1]) - self.shift[1]
+        if self.reversed:
+            xv = xv[::-1]
+
+        # Left part of the masks.
+        w1, w2 = self.translate_coefficients(delta)
+        y1 = w1[0] + w1[1] * xv + w1[2] * xv**2
+        y2 = w2[0] + w2[1] * xv + w2[2] * xv**2
+        lmask = yv <= y1
+        rmask = yv <= y2
+
+        # Right part of the masks.
+        w1, w2 = self.translate_coefficients(-delta)
+        y1 = w1[0] + w1[1] * xv + w1[2] * xv**2
+        y2 = w2[0] + w2[1] * xv + w2[2] * xv**2
+        lmask = np.logical_and(lmask, yv >= y1)
+        rmask = np.logical_and(rmask, yv >= y2)
+
+        return lmask, rmask
+

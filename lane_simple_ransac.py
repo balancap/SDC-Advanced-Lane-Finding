@@ -4,6 +4,7 @@
 #
 # License: BSD 3 clause
 
+import copy
 import numpy as np
 import numba
 
@@ -92,6 +93,13 @@ def inverse_3x3_symmetric(m):
 # Ransac pre-fitting.
 # =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
+def numpy_sign(x):
+    if x >= 0:
+        return 1
+    else:
+        return -1
+
+@numba.jit(nopython=True, nogil=True)
 def is_model_valid(w, wrefs, bounds):
     """Check if a regression diffs model is valid, based on the coefficients.
     Use references coefficients to check w is inside valid bounds.
@@ -132,7 +140,7 @@ def is_model_valid(w, wrefs, bounds):
         a2b1 = np.abs(w[2]) * (1 + wref[1]**2)**1.5
         s = a1b2 + a2b1
         if s > _EPSILON:
-            rel_curv = (a1b2*np.sign(w[2]) - a2b1*np.sign(wref[2]) + 2*dist*np.abs(w[2]*wref[2])) / s
+            rel_curv = (a1b2*numpy_sign(w[2]) - a2b1*numpy_sign(wref[2]) + 2*dist*np.abs(w[2]*wref[2])) / s
             res = res and np.abs(rel_curv) >= diffs[2, 0]
             res = res and np.abs(rel_curv) <= diffs[2, 1]
     return res
@@ -224,7 +232,8 @@ def test_lanes_ransac_prefit(n_prefits=1000):
 # =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
 def m_regression_exp(X, y, w0, scales):
-    """
+    """M-estimator used to regularise predictions. Use exponential weights.
+    Iterates over an array of scales.
     """
     w = np.copy(w0)
     XX = np.copy(X)
@@ -280,12 +289,28 @@ def linear_regression_score(X, y, w, mask):
 # Ransac Regression: best fit selection.
 # =========================================================================== #
 @numba.jit(nopython=True, nogil=True)
+def lanes_inliers(X, y, w, residual_threshold):
+    """Compute the RANSAC inliers mask, based on a given threshold and
+    regression coefficients.
+    """
+    y_pred = X @ w
+    residuals_subset = np.abs(y - y_pred)
+    inlier_mask_subset = residuals_subset < residual_threshold
+    return inlier_mask_subset
+
+
+@numba.jit(nopython=True, nogil=True)
 def ransac_absolute_loss(y_true, y_pred):
+    """Absolute loss!
+    """
     return np.abs(y_true - y_pred)
 
 
 @numba.jit(nopython=True, nogil=True)
 def lanes_ransac_select_best(X, y, w_prefits, residual_threshold):
+    """Select best pre-fit from a collection. Score them using the number
+    of inliers: keep the one cumulating the highest number.
+    """
     n_prefits = w_prefits.shape[0]
 
     # Best match variables.
@@ -327,139 +352,15 @@ def lanes_ransac_select_best(X, y, w_prefits, residual_threshold):
     return best_w, inlier_mask_best
 
 
-@numba.jit(nopython=True, nogil=True)
-def lanes_inliers(X, y, w, residual_threshold):
-    y_pred = X @ w
-    residuals_subset = np.abs(y - y_pred)
-    inlier_mask_subset = residuals_subset < residual_threshold
-    return inlier_mask_subset
-
-
 # =========================================================================== #
 # Main Ransac Regression class. Scikit-inspired implementation.
 # =========================================================================== #
 class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
-    """RANSAC (RANdom SAmple Consensus) algorithm.
+    """RANSAC (RANdom SAmple Consensus) algorithm adapted to lanes detection.
 
     RANSAC is an iterative algorithm for the robust estimation of parameters
-    from a subset of inliers from the complete data set. More information can
-    be found in the general documentation of linear models.
-
-    A detailed description of the algorithm can be found in the documentation
-    of the ``linear_model`` sub-package.
-
-    Read more in the :ref:`User Guide <ransac_regression>`.
-
-    Parameters
-    ----------
-    base_estimator : object, optional
-        Base estimator object which implements the following methods:
-
-        * `fit(X, y)`: Fit model to given training data and target values.
-        * `score(X, y)`: Returns the mean accuracy on the given test data,
-           which is used for the stop criterion defined by `stop_score`.
-           Additionally, the score is used to decide which of two equally
-           large consensus sets is chosen as the better one.
-
-        If `base_estimator` is None, then
-        ``base_estimator=sklearn.linear_model.LinearRegression()`` is used for
-        target values of dtype float.
-
-        Note that the current implementation only supports regression
-        estimators.
-
-    min_samples : int (>= 1) or float ([0, 1]), optional
-        Minimum number of samples chosen randomly from original data. Treated
-        as an absolute number of samples for `min_samples >= 1`, treated as a
-        relative number `ceil(min_samples * X.shape[0]`) for
-        `min_samples < 1`. This is typically chosen as the minimal number of
-        samples necessary to estimate the given `base_estimator`. By default a
-        ``sklearn.linear_model.LinearRegression()`` estimator is assumed and
-        `min_samples` is chosen as ``X.shape[1] + 1``.
-
-    residual_threshold : float, optional
-        Maximum residual for a data sample to be classified as an inlier.
-        By default the threshold is chosen as the MAD (median absolute
-        deviation) of the target values `y`.
-
-    is_data_valid : callable, optional
-        This function is called with the randomly selected data before the
-        model is fitted to it: `is_data_valid(X, y)`. If its return value is
-        False the current randomly chosen sub-sample is skipped.
-
-    is_model_valid : callable, optional
-        This function is called with the estimated model and the randomly
-        selected data: `is_model_valid(model, X, y)`. If its return value is
-        False the current randomly chosen sub-sample is skipped.
-        Rejecting samples with this function is computationally costlier than
-        with `is_data_valid`. `is_model_valid` should therefore only be used if
-        the estimated model is needed for making the rejection decision.
-
-    max_trials : int, optional
-        Maximum number of iterations for random sample selection.
-
-    stop_n_inliers : int, optional
-        Stop iteration if at least this number of inliers are found.
-
-    stop_score : float, optional
-        Stop iteration if score is greater equal than this threshold.
-
-    stop_probability : float in range [0, 1], optional
-        RANSAC iteration stops if at least one outlier-free set of the training
-        data is sampled in RANSAC. This requires to generate at least N
-        samples (iterations)::
-
-            N >= log(1 - probability) / log(1 - e**m)
-
-        where the probability (confidence) is typically set to high value such
-        as 0.99 (the default) and e is the current fraction of inliers w.r.t.
-        the total number of samples.
-
-    residual_metric : callable, optional
-        Metric to reduce the dimensionality of the residuals to 1 for
-        multi-dimensional target values ``y.shape[1] > 1``. By default the sum
-        of absolute differences is used::
-
-            lambda dy: np.sum(np.abs(dy), axis=1)
-
-        NOTE: residual_metric is deprecated from 0.18 and will be removed in 0.20
-        Use ``loss`` instead.
-
-    loss : string, callable, optional, default "absolute_loss"
-        String inputs, "absolute_loss" and "squared_loss" are supported which
-        find the absolute loss and squared loss per sample
-        respectively.
-
-        If ``loss`` is a callable, then it should be a function that takes
-        two arrays as inputs, the true and predicted value and returns a 1-D
-        array with the ``i``th value of the array corresponding to the loss
-        on `X[i]`.
-
-        If the loss on a sample is greater than the ``residual_threshold``, then
-        this sample is classified as an outlier.
-
-    random_state : integer or numpy.RandomState, optional
-        The generator used to initialize the centers. If an integer is
-        given, it fixes the seed. Defaults to the global numpy random
-        number generator.
-
-    Attributes
-    ----------
-    estimator_ : object
-        Best fitted model (copy of the `base_estimator` object).
-
-    n_trials_ : int
-        Number of random selection trials until one of the stop criteria is
-        met. It is always ``<= max_trials``.
-
-    inlier_mask_ : bool array of shape [n_samples]
-        Boolean mask of inliers classified as ``True``.
-
-    References
-    ----------
-    .. [1] https://en.wikipedia.org/wiki/RANSAC
-    .. [2] http://www.cs.columbia.edu/~belhumeur/courses/compPhoto/ransac.pdf
-    .. [3] http://www.bmva.org/bmvc/2009/Papers/Paper355/Paper355.pdf
+    from a subset of inliers from the complete data set. We adapt here this
+    generic algorithm to out lanes finding problem.
     """
 
     def __init__(self,
@@ -471,6 +372,7 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                  is_valid_bounds_left=None,
                  is_valid_bounds_right=None,
                  l2_scales=None,
+                 smoothing=1.,
                  stop_n_inliers=np.inf,
                  stop_score=np.inf,
                  stop_probability=0.99,
@@ -495,6 +397,7 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             self.is_valid_bounds_right = is_valid_bounds_right
 
         self.l2_scales = l2_scales
+        self.smoothing = smoothing
 
         self.stop_n_inliers = stop_n_inliers
         self.stop_score = stop_score
@@ -532,7 +435,10 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             residual_threshold = self.residual_threshold
         # random_state = check_random_state(self.random_state)
 
+        # Collections...
         self.w_fits = []
+        self.w_fits_l2 = []
+        self.inliers_masks = []
         self.n_inliers = []
 
         # === Left lane, and then, right lane === #
@@ -555,18 +461,12 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         (w_right1, in_mask_right1) = lanes_ransac_select_best(X2, y2,
                                                               w_right_prefits,
                                                               residual_threshold)
-        # L2 regression regularisation
-        if self.l2_scales is not None:
-            w_left1 = m_regression_exp(X1, y1, w_left1, self.l2_scales)
-            in_mask_left1 = lanes_inliers(X1, y1, w_left1, residual_threshold)
-            w_right1 = m_regression_exp(X2, y2, w_right1, self.l2_scales)
-            in_mask_right1 = lanes_inliers(X2, y2, w_right1, residual_threshold)
-
         n_inliers_right1 = np.sum(in_mask_right1)
         n_inliers1 = n_inliers_right1 + n_inliers_left1
 
         self.w_fits.append((w_left1, w_right1))
-        self.n_inliers.append((n_inliers_left1, n_inliers_right1))
+        self.n_inliers.append(n_inliers1)
+        self.inliers_masks.append((in_mask_left1, in_mask_right1))
 
         # === Right lane and then left lane === #
         w_right_prefits = lanes_ransac_prefit(X2, y2,
@@ -588,47 +488,49 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         (w_left2, in_mask_left2) = lanes_ransac_select_best(X1, y1,
                                                             w_left_prefits,
                                                             residual_threshold)
-        # L2 regression regularisation
-        if self.l2_scales is not None:
-            w_left2 = m_regression_exp(X1, y1, w_left2, self.l2_scales)
-            in_mask_left2 = lanes_inliers(X1, y1, w_left2, residual_threshold)
-            w_right2 = m_regression_exp(X2, y2, w_right2, self.l2_scales)
-            in_mask_right2 = lanes_inliers(X2, y2, w_right2, residual_threshold)
-
         n_inliers_left2 = np.sum(in_mask_left2)
         n_inliers2 = n_inliers_right2 + n_inliers_left2
 
         self.w_fits.append((w_left2, w_right2))
-        self.n_inliers.append((n_inliers_left2, n_inliers_right2))
+        self.n_inliers.append(n_inliers2)
+        self.inliers_masks.append((in_mask_left2, in_mask_right2))
 
-        # Fit from previous frame?
-        n_inliers3 = 0
+        # === Previous frame??? === #
         if self.w_refs_left.size > 0 and self.w_refs_right.size > 0:
-            w_left3 = m_regression_exp(X1, y1, self.w_refs_left[0], self.l2_scales)
-            in_mask_left3 = lanes_inliers(X1, y1, w_left3, residual_threshold)
-            w_right3 = m_regression_exp(X2, y2, self.w_refs_right[0], self.l2_scales)
-            in_mask_right3 = lanes_inliers(X2, y2, w_right3, residual_threshold)
-
-            self.w_fits.append((w_left3, w_right3))
-            self.n_inliers.append((np.sum(in_mask_left3), np.sum(in_mask_right3)))
+            in_mask_left3 = lanes_inliers(X1, y1, self.w_refs_left[0], residual_threshold)
+            in_mask_right3 = lanes_inliers(X2, y2, self.w_refs_right[0], residual_threshold)
             n_inliers3 = np.sum(in_mask_left3) + np.sum(in_mask_right3)
 
+            self.w_fits.append((self.w_refs_left[0], self.w_refs_right[0]))
+            self.n_inliers.append(n_inliers3)
+            self.inliers_masks.append((in_mask_left3, in_mask_right3))
+
+        # L2 regression regularisation of fits.
+        self.w_fits_l2 = copy.deepcopy(self.w_fits)
+        if self.l2_scales is not None:
+            for i in range(len(self.w_fits)):
+                w1, w2 = self.w_fits[i]
+                w_left = m_regression_exp(X1, y1, w1, self.l2_scales)
+                w_right = m_regression_exp(X2, y2, w2, self.l2_scales)
+
+                in_mask_left = lanes_inliers(X1, y1, w_left, residual_threshold)
+                in_mask_right = lanes_inliers(X2, y2, w_right, residual_threshold)
+                n_inliers = np.sum(in_mask_left) + np.sum(in_mask_right)
+
+                self.w_fits_l2[i] = (w_left, w_right)
+                self.n_inliers[i] = n_inliers
+                self.inliers_masks[i] = (in_mask_left, in_mask_right)
+
         # Best fit?
-        if n_inliers1 < n_inliers2 and n_inliers3 < n_inliers2:
-            w_left = w_left2
-            w_right = w_right2
-            in_mask_left = in_mask_left2
-            in_mask_right = in_mask_right2
-        elif n_inliers1 < n_inliers3 and n_inliers2 < n_inliers3:
-            w_left = w_left3
-            w_right = w_right3
-            in_mask_left = in_mask_left3
-            in_mask_right = in_mask_right3
-        else:
-            w_left = w_left1
-            w_right = w_right1
-            in_mask_left = in_mask_left1
-            in_mask_right = in_mask_right1
+        idx = np.argmax(self.n_inliers)
+        w_left, w_right = self.w_fits_l2[idx]
+        in_mask_left, in_mask_right = self.inliers_masks[idx]
+
+        # Smoothing.
+        smoothing = self.smoothing
+        if self.w_refs_left.size > 0 and self.w_refs_right.size > 0:
+            w_left = smoothing * w_left + (1. - smoothing) * self.w_refs_left[0]
+            w_right = smoothing * w_right + (1. - smoothing) * self.w_refs_right[0]
 
         self.w1_ = w_left
         self.w2_ = w_right
