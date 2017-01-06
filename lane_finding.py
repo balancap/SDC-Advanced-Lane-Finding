@@ -571,3 +571,74 @@ class LanesFit():
 
         return lmask, rmask
 
+
+def lane_mask(shape, x, y, width):
+    mask = np.zeros(shape, dtype=np.uint8)
+    for w in range(width):
+        xx = np.maximum(np.minimum(x, shape[0]-1), 0).astype(np.int)
+        yy = np.maximum(np.minimum(y+w, shape[1]-1), 0).astype(np.int)
+        mask[xx, yy] = 255
+        yy = np.maximum(np.minimum(y-w, shape[1]-1), 0).astype(np.int)
+        mask[xx, yy] = 255
+    return mask
+
+
+def debug_frame(main_img, wimg, wmasks, lmask, rmask, lanes_ransac):
+    shape = main_img.shape[0:2]
+    half_shape = (shape[0] // 2, shape[1] // 2)
+    new_shape = (int(shape[0] * 1.5), int(shape[1] * 1.5), 3)
+    dimg = np.zeros(new_shape, dtype=main_img.dtype)
+
+    # Main image
+    dimg[:shape[0], :shape[1]] = main_img
+
+    # Masks images...
+    l = 2
+    offset = 0
+    titles = ['RGB gradients mask',
+              'HSV gradients mask']
+    for i in range(l):
+        img = np.copy(wimg)
+        img = draw_mask(img, lmask, alpha=.9, beta=1., gamma=0., color=[20, 0, 0])
+        img = draw_mask(img, rmask, alpha=1, beta=1., gamma=0., color=[0, 20, 0])
+        img = draw_mask(img, wmasks[i], alpha=0.9, beta=1., gamma=0., color=[255, 255, 0])
+        cv2.putText(img, titles[i], (50, 70), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+
+        dimg[shape[0]:, offset:offset+shape[1]//2] = cv2.resize(img, half_shape[::-1])
+        offset += half_shape[1]
+
+    # Lanes fits.
+    l = min(len(lanes_ransac.w_fits), 3)
+    offset = 0
+    titles = ['Left -> Right RANSAC + L2 regr.',
+              'Right -> Left RANSAC + L2 regr.',
+              'Previous frame + L2 regr.']
+    for i in range(l):
+        w1, w2 = lanes_ransac.w_fits[i]
+        m1, m2 = lanes_ransac.inliers_masks[i]
+        n1 = np.sum(m1)
+        n2 = np.sum(m2)
+        X_lane, y1_lane, y2_lane = predict_lanes_w(w1, w2, wimg, reversed_x=True, normalised=True)
+        x_lane = X_lane[:, 1]
+
+        # Lanes predictions.
+        left_mask = lane_mask(shape, x_lane, y1_lane, 8)
+        right_mask = lane_mask(shape, x_lane, y2_lane, 8)
+
+        dist_lanes = w2[0] - w1[0]
+        curv1 = lane_curvature(w1)
+        curv2 = lane_curvature(w2)
+
+        img = np.copy(wimg)
+        img = draw_mask(img, left_mask, alpha=.7, beta=1., gamma=0., color=[255, 0, 0])
+        img = draw_mask(img, right_mask, alpha=1, beta=1., gamma=0., color=[0, 255, 0])
+        cv2.putText(img, titles[i], (50, 70), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+        cv2.putText(img, 'Inliers: %i | %i' % (n1, n2), (50, 120), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+        cv2.putText(img, 'Curvatures:  %.2f |  %.2f' % (curv1, curv2), (50, 170), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+        cv2.putText(img, 'W1:  %s' % w1, (50, 220), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+        cv2.putText(img, 'W2:  %s' % w2, (50, 270), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+
+        dimg[offset:offset+shape[0]//2:, shape[1]:] = cv2.resize(img, half_shape[::-1])
+        offset += half_shape[0]
+
+    return dimg
