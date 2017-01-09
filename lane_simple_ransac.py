@@ -164,7 +164,7 @@ def lanes_ransac_prefit(X, y,
       w_refs: Coefficients used for checking validity.
       is_valid_bounds: Bounds used for checking validity.
     """
-    min_prefits = 1
+    min_prefits = 0
     is_valid_check = w_refs.size == 0
 
     shape = X.shape
@@ -176,7 +176,7 @@ def lanes_ransac_prefit(X, y,
     idxes = np.arange(shape[0])
 
     # Add w references to prefits.
-    i += 1
+    # i += 1
     # n_refs = w_refs.shape[0]
     # for k in range(n_refs):
     #     w_prefits[i] = w_refs[k]
@@ -225,6 +225,17 @@ def test_lanes_ransac_prefit(n_prefits=1000):
     w_refs = np.ones((1, 3), dtype=X.dtype)
     valid_bounds = np.ones((1, 3, 2), dtype=X.dtype)
     lanes_ransac_prefit(X, y, n_prefits, n_prefits, w_refs, valid_bounds)
+
+
+@numba.jit(nopython=True, nogil=True)
+def lane_translate(w, delta):
+    """Translate a lane coefficient while keeping same curvature center.
+    """
+    w1 = np.copy(w)
+    w1[0] = delta + w[0]
+    w1[1] = w[1]
+    w1[2] = w[2] * (1 + w[1]**2)**1.5 / ((1 + w[1]**2)**1.5 - 2*delta*w[2])
+    return w1
 
 
 # =========================================================================== #
@@ -300,6 +311,17 @@ def lanes_inliers(X, y, w, residual_threshold):
 
 
 @numba.jit(nopython=True, nogil=True)
+def lane_score(n_inliers, w, wrefs, lambdas):
+    score = lambdas[0] * n_inliers
+    if wrefs.size > 0:
+        wref = wrefs[0]
+        score += np.exp(-(w[0] - wref[0])**2 / lambdas[1]**2)
+        score += np.exp(-(w[1] - wref[1])**2 / lambdas[2]**2)
+        score += np.exp(-(w[2] - wref[2])**2 / lambdas[3]**2)
+    return score
+
+
+@numba.jit(nopython=True, nogil=True)
 def ransac_absolute_loss(y_true, y_pred):
     """Absolute loss!
     """
@@ -307,15 +329,15 @@ def ransac_absolute_loss(y_true, y_pred):
 
 
 @numba.jit(nopython=True, nogil=True)
-def lanes_ransac_select_best(X, y, w_prefits, residual_threshold):
+def lanes_ransac_select_best(X, y, w_prefits, residual_threshold, wrefs, lambdas):
     """Select best pre-fit from a collection. Score them using the number
     of inliers: keep the one cumulating the highest number.
     """
     n_prefits = w_prefits.shape[0]
+    n_points = np.float32(y.size)
 
     # Best match variables.
-    n_inliers_best = 0
-    score_best = np.inf
+    score_best = -np.inf
     inlier_mask_best = (y == np.inf)
     best_w = w_prefits[0]
 
@@ -333,23 +355,15 @@ def lanes_ransac_select_best(X, y, w_prefits, residual_threshold):
         inlier_mask_subset = residuals_subset < residual_threshold
         n_inliers_subset = np.sum(inlier_mask_subset)
 
-        # less inliers -> skip current random sample
-        if n_inliers_subset < n_inliers_best:
-            continue
+        # Compute score.
+        score_subset = lane_score(n_inliers_subset, w, wrefs, lambdas)
+        if score_subset > score_best:
+            # Save current random sample as best sample
+            score_best = score_subset
+            inlier_mask_best = inlier_mask_subset
+            best_w = w
 
-        # Score of inlier datasets
-        score_subset = linear_regression_score(X, y, w, inlier_mask_subset)
-        # same number of inliers but worse score -> skip.
-        if (n_inliers_subset == n_inliers_best and score_subset < score_best):
-            continue
-
-        # Save current random sample as best sample
-        score_best = score_subset
-        n_inliers_best = n_inliers_subset
-        inlier_mask_best = inlier_mask_subset
-        best_w = w
-
-    return best_w, inlier_mask_best
+    return best_w, inlier_mask_best, score_best
 
 
 # =========================================================================== #
@@ -372,11 +386,13 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                  is_valid_bounds_left=None,
                  is_valid_bounds_right=None,
                  l2_scales=None,
+                 score_lambdas=None,
                  smoothing=1.,
                  stop_n_inliers=np.inf,
                  stop_score=np.inf,
                  stop_probability=0.99,
-                 random_state=None):
+                 random_state=None,
+                 dtype=np.float32):
 
         self.residual_threshold = residual_threshold
 
@@ -384,20 +400,24 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
         self.max_trials = max_trials
 
         if w_refs_left is None:
-            self.w_refs_left = np.zeros((0, 3), dtype=np.float32)
-            self.is_valid_bounds_left = np.zeros((0, 3, 2), dtype=np.float32)
+            self.w_refs_left = np.zeros((0, 3), dtype=dtype)
+            self.is_valid_bounds_left = np.zeros((0, 3, 2), dtype=dtype)
         else:
             self.w_refs_left = w_refs_left
             self.is_valid_bounds_left = is_valid_bounds_left
         if w_refs_right is None:
             self.w_refs_right = np.zeros((0, 3), dtype=np.float32)
-            self.is_valid_bounds_right = np.zeros((0, 3, 2), dtype=np.float32)
+            self.is_valid_bounds_right = np.zeros((0, 3, 2), dtype=dtype)
         else:
             self.w_refs_right = w_refs_right
             self.is_valid_bounds_right = is_valid_bounds_right
 
         self.l2_scales = l2_scales
         self.smoothing = smoothing
+        if score_lambdas is None:
+            self.score_lambdas = np.ones((4, ), dtype=dtype)
+        else:
+            self.score_lambdas = score_lambdas
 
         self.stop_n_inliers = stop_n_inliers
         self.stop_score = stop_score
@@ -433,13 +453,19 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
             residual_threshold = np.median(np.abs(y - np.median(y)))
         else:
             residual_threshold = self.residual_threshold
+        delta_left_right = (left_right_bounds[0, 0, 1] + left_right_bounds[0, 0, 0]) / 2.
         # random_state = check_random_state(self.random_state)
+
+        # Set up lambdas for computing score.
+        score_lambdas = np.copy(self.score_lambdas)
+        score_lambdas[0] = score_lambdas[0] / (y1.size + y2.size)
 
         # Collections...
         self.w_fits = []
         self.w_fits_l2 = []
         self.inliers_masks = []
         self.n_inliers = []
+        self.score_fits = []
 
         # === Left lane, and then, right lane === #
         w_left_prefits = lanes_ransac_prefit(X1, y1,
@@ -447,10 +473,12 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                                              self.max_trials,
                                              self.w_refs_left,
                                              self.is_valid_bounds_left)
-        (w_left1, in_mask_left1) = lanes_ransac_select_best(X1, y1,
-                                                            w_left_prefits,
-                                                            residual_threshold)
+        (w_left1, in_mask_left1, score_left1) = \
+            lanes_ransac_select_best(X1, y1,
+                                     w_left_prefits, residual_threshold,
+                                     self.w_refs_left, score_lambdas)
         n_inliers_left1 = np.sum(in_mask_left1)
+
         w_refs = np.vstack((self.w_refs_right, np.reshape(w_left1, (1, 3))))
         is_valid_bounds = np.vstack((self.is_valid_bounds_right, left_right_bounds))
         w_right_prefits = lanes_ransac_prefit(X2, y2,
@@ -458,15 +486,20 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                                               self.max_trials,
                                               w_refs,
                                               is_valid_bounds)
-        (w_right1, in_mask_right1) = lanes_ransac_select_best(X2, y2,
-                                                              w_right_prefits,
-                                                              residual_threshold)
+        w0 = lane_translate(w_left1, delta_left_right)
+        w_right_prefits = np.vstack((w0, w_right_prefits))
+
+        (w_right1, in_mask_right1, score_right1) = \
+            lanes_ransac_select_best(X2, y2,
+                                     w_right_prefits, residual_threshold,
+                                     self.w_refs_right, score_lambdas)
         n_inliers_right1 = np.sum(in_mask_right1)
         n_inliers1 = n_inliers_right1 + n_inliers_left1
 
         self.w_fits.append((w_left1, w_right1))
         self.n_inliers.append(n_inliers1)
         self.inliers_masks.append((in_mask_left1, in_mask_right1))
+        self.score_fits.append((score_left1, score_right1))
 
         # === Right lane and then left lane === #
         w_right_prefits = lanes_ransac_prefit(X2, y2,
@@ -474,9 +507,10 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                                               self.max_trials,
                                               self.w_refs_right,
                                               self.is_valid_bounds_right)
-        (w_right2, in_mask_right2) = lanes_ransac_select_best(X2, y2,
-                                                              w_right_prefits,
-                                                              residual_threshold)
+        (w_right2, in_mask_right2, score_right2) = \
+            lanes_ransac_select_best(X2, y2,
+                                     w_right_prefits, residual_threshold,
+                                     self.w_refs_right, score_lambdas)
         n_inliers_right2 = np.sum(in_mask_right2)
         w_refs = np.vstack((self.w_refs_left, np.reshape(w_right2, (1, 3))))
         is_valid_bounds = np.vstack((self.is_valid_bounds_left, left_right_bounds))
@@ -485,44 +519,75 @@ class SLanesRANSACRegressor(BaseEstimator, MetaEstimatorMixin, RegressorMixin):
                                              self.max_trials,
                                              w_refs,
                                              is_valid_bounds)
-        (w_left2, in_mask_left2) = lanes_ransac_select_best(X1, y1,
-                                                            w_left_prefits,
-                                                            residual_threshold)
+        w0 = lane_translate(w_right2, -delta_left_right)
+        w_left_prefits = np.vstack((w0, w_left_prefits))
+
+        (w_left2, in_mask_left2, score_left2) = \
+            lanes_ransac_select_best(X1, y1,
+                                     w_left_prefits, residual_threshold,
+                                     self.w_refs_left, score_lambdas)
         n_inliers_left2 = np.sum(in_mask_left2)
         n_inliers2 = n_inliers_right2 + n_inliers_left2
 
         self.w_fits.append((w_left2, w_right2))
         self.n_inliers.append(n_inliers2)
         self.inliers_masks.append((in_mask_left2, in_mask_right2))
+        self.score_fits.append((score_left2, score_right2))
 
         # === Previous frame??? === #
         if self.w_refs_left.size > 0 and self.w_refs_right.size > 0:
             in_mask_left3 = lanes_inliers(X1, y1, self.w_refs_left[0], residual_threshold)
             in_mask_right3 = lanes_inliers(X2, y2, self.w_refs_right[0], residual_threshold)
             n_inliers3 = np.sum(in_mask_left3) + np.sum(in_mask_right3)
+            score_left3 = lane_score(np.sum(in_mask_left3),
+                                     self.w_refs_left[0],
+                                     self.w_refs_left,
+                                     score_lambdas)
+            score_right3 = lane_score(np.sum(in_mask_right3),
+                                      self.w_refs_right[0],
+                                      self.w_refs_right,
+                                      score_lambdas)
 
             self.w_fits.append((self.w_refs_left[0], self.w_refs_right[0]))
             self.n_inliers.append(n_inliers3)
             self.inliers_masks.append((in_mask_left3, in_mask_right3))
+            self.score_fits.append((score_left3, score_right3))
 
         # L2 regression regularisation of fits.
         self.w_fits_l2 = copy.deepcopy(self.w_fits)
         if self.l2_scales is not None:
             for i in range(len(self.w_fits)):
                 w1, w2 = self.w_fits[i]
-                w_left = m_regression_exp(X1, y1, w1, self.l2_scales)
-                w_right = m_regression_exp(X2, y2, w2, self.l2_scales)
+                # Some regression: ignored when inversed matrix error.
+                try:
+                    w_left = m_regression_exp(X1, y1, w1, self.l2_scales)
+                except Exception:
+                    w_left = w1
+                try:
+                    w_right = m_regression_exp(X2, y2, w2, self.l2_scales)
+                except Exception:
+                    w_right = w2
 
                 in_mask_left = lanes_inliers(X1, y1, w_left, residual_threshold)
                 in_mask_right = lanes_inliers(X2, y2, w_right, residual_threshold)
                 n_inliers = np.sum(in_mask_left) + np.sum(in_mask_right)
+                score_left = lane_score(np.sum(in_mask_left),
+                                        w_left,
+                                        self.w_refs_left,
+                                        score_lambdas)
+                score_right = lane_score(np.sum(in_mask_right),
+                                         w_right,
+                                         self.w_refs_right,
+                                         score_lambdas)
 
                 self.w_fits_l2[i] = (w_left, w_right)
                 self.n_inliers[i] = n_inliers
                 self.inliers_masks[i] = (in_mask_left, in_mask_right)
+                self.score_fits[i] = (score_left, score_right)
 
         # Best fit?
-        idx = np.argmax(self.n_inliers)
+        scores = [s1+s2 for (s1, s2) in self.score_fits]
+        idx = np.argmax(scores)
         w_left, w_right = self.w_fits_l2[idx]
         in_mask_left, in_mask_right = self.inliers_masks[idx]
 

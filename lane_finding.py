@@ -584,6 +584,8 @@ def lane_mask(shape, x, y, width):
 
 
 def debug_frame(main_img, wimg, wmasks, lmask, rmask, lanes_ransac):
+    """Create a debug frame...
+    """
     shape = main_img.shape[0:2]
     half_shape = (shape[0] // 2, shape[1] // 2)
     new_shape = (int(shape[0] * 1.5), int(shape[1] * 1.5), 3)
@@ -615,9 +617,6 @@ def debug_frame(main_img, wimg, wmasks, lmask, rmask, lanes_ransac):
               'Previous frame + L2 regr.']
     for i in range(l):
         w1, w2 = lanes_ransac.w_fits[i]
-        m1, m2 = lanes_ransac.inliers_masks[i]
-        n1 = np.sum(m1)
-        n2 = np.sum(m2)
         X_lane, y1_lane, y2_lane = predict_lanes_w(w1, w2, wimg, reversed_x=True, normalised=True)
         x_lane = X_lane[:, 1]
 
@@ -632,6 +631,11 @@ def debug_frame(main_img, wimg, wmasks, lmask, rmask, lanes_ransac):
         img = np.copy(wimg)
         img = draw_mask(img, left_mask, alpha=.7, beta=1., gamma=0., color=[255, 0, 0])
         img = draw_mask(img, right_mask, alpha=1, beta=1., gamma=0., color=[0, 255, 0])
+
+        # Add text...
+        m1, m2 = lanes_ransac.inliers_masks[i]
+        n1 = np.sum(m1)
+        n2 = np.sum(m2)
         cv2.putText(img, titles[i], (50, 70), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
         cv2.putText(img, 'Inliers: %i | %i' % (n1, n2), (50, 120), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
         cv2.putText(img, 'Curvatures:  %.2f |  %.2f' % (curv1, curv2), (50, 170), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
